@@ -38,4 +38,10 @@ def visualize_pid_mapping(M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M):
 print("Example with 8x8 matrix:")
 visualize_pid_mapping(M=8, N=8, BLOCK_SIZE_M=2, BLOCK_SIZE_N=2, GROUP_SIZE_M=2)
 
-
+import torch
+print(torch.tensor([]).element_size())
+print(torch.tensor([], dtype=torch.uint8).element_size())
+print(torch.tensor([1.]).element_size())
+print(torch.tensor([1.], dtype=torch.uint8).element_size())
+print(torch.tensor([1.,2.]).element_size())
+print(torch.tensor([1.,2.], dtype=torch.uint8).element_size())
