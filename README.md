@@ -7,8 +7,8 @@ You might be asking: why are we using Triton instead of CUDA? I'm open to the id
 
 |      | triton                                                                                            | cuda                                                             |
 | ---- | ------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| pros | - written in Python (quicker to learn)<br>- works on more than just Nvidia GPUs<br>- open-sourced | - broadly used<br>- linux or windows                             |
-| cons | - less commonly used<br>- requires linux                                                          | - written in C<br>- only works on Nvidia GPUs<br>- closed-source |
+| pros | - written in Python (quicker to learn)<br>- works on more than just Nvidia GPUs<br>- open-sourced<br>- less to think about when programming | - broadly used<br>- linux or windows <br>- marginally faster                            |
+| cons | - less commonly used<br>- requires linux<br>- marginally slower                                                          | - written in C<br>- only works on Nvidia GPUs<br>- closed-source<br>- more complicated |
 
 Personally I'm on a Mac so i plan on doing all my work on a cloud provider like [lambdalabs](https://lambdalabs.com) anyways so the windows availability didn't matter much to me. That and I highly value the pythonic syntax and potential future widespread compatibility. 
 
@@ -52,10 +52,13 @@ pip install numpy matplotlib pandas torch triton
 here's someone else's helpful attempt at explaining the official docs but every fifth line from them was "idk what this does"
 - https://isamu-website.medium.com/understanding-the-triton-tutorials-part-1-6191b59ba4c
 - https://isamu-website.medium.com/understanding-triton-tutorials-part-2-f6839ce50ae7
+
 here's a flash-attention implementation by one of my fav youtubers
 - https://github.com/hkproj/triton-flash-attention
+
 meta's xformers repo implements basically everything one could need
 - https://github.com/facebookresearch/xformers
+
 here's a wider set of GPU kernel guides that includes an intro to Triton in lesson 14
 - https://github.com/gpu-mode/lectures/tree/main
 
