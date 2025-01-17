@@ -95,12 +95,6 @@ def _layer_norm_backward_dx_fused(DX,  # pointer to the input gradient
     X += row * stride
     DY += row * stride
     DX += row * stride
-    # Offset locks and weights/biases gradient pointer for parallel reduction
-    lock_id = row % GROUP_SIZE_M # TODO i think my triple quotes explanation was wrong; different PIDs contribute to same group thanks to lock somehow
-    Lock += lock_id
-    Count = Lock + GROUP_SIZE_M
-    DW = DW + lock_id * N + cols
-    DB = DB + lock_id * N + cols
     # Load data to SRAM
     x = tl.load(X + cols, mask=mask, other=0).to(tl.float32)
     dy = tl.load(DY + cols, mask=mask, other=0).to(tl.float32)
@@ -118,6 +112,14 @@ def _layer_norm_backward_dx_fused(DX,  # pointer to the input gradient
     # Accumulate partial sums for dw/db
     partial_dw = (dy * xhat).to(w.dtype)
     partial_db = (dy).to(w.dtype)
+    # now we'll offset locks and weights/biases gradient pointer for parallel reduction.
+    # getting an ID for the block is used in knowing when to let a given pid accumulate
+    lock_id = row % GROUP_SIZE_M 
+    Lock += lock_id
+    Count = Lock + GROUP_SIZE_M
+    DW = DW + lock_id * N + cols
+    DB = DB + lock_id * N + cols
+    # the lock is used to ensure that only one kernel instance writes to the buffer at a time
     while tl.atomic_cas(Lock, 0, 1) == 1: # TODO: figure out what this does
         pass
     count = tl.load(Count)
