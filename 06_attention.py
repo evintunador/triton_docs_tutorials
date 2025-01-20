@@ -41,13 +41,13 @@ def _attn_fwd_inner(
     else: # runs on every single block for the case that we're not using a causal mask
         lo, hi = 0, SEQ_LEN
 
-    K_block_ptr = tl.advance(K_block_ptr, (0, lo))
-    V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
+    K_block_ptrs = tl.advance(K_block_ptr, (0, lo))
+    V_block_ptrs = tl.advance(V_block_ptr, (lo, 0))
     """
     Here are the above ^ two lines implemented with manual pointers.
-    Remember you can't mix automatic & manual implementations; choose one & stick to it
-    K_block_ptr += lo * stride_K_seq
-    V_block_ptr += lo * stride_V_seq
+    Remember you can't mix automatic & manual pointer implementations; choose one & stick to it
+    K_block_ptrs += lo * stride_K_seq
+    V_block_ptrs += lo * stride_V_seq
     """
 
     # loop over k, v and update accumulator
@@ -58,14 +58,14 @@ def _attn_fwd_inner(
 
         # compute (Q @ K^T) / sqrt{head_dim}
         K_block = tl.load(K_block_ptr)
-        QK_block = tl.dot(Q_block, K_block) * softmax_scale
+        QK_block = tl.dot(Q_block, K_block) * softmax_scale # becomes shape (BLOCK_SIZE_Q, BLOCK_SIZE_KV)
 
         if CAUSAL and DIAGONAL: # if causal mask and we're currently on a block containing the diagonal
             mask = offsets_q.expand_dims(1) >= (start_kv + offsets_kv.expand_dims(0))
             QK_block += tl.where(mask, 0, -1.0e6) # TODO is -1.e6 the most efficient choice for -inf in Triton?
         
         # find the max values of the new block and compare them to those of all previous blocks to get an update
-        m_ij = tl.maximum(m_i, tl.max(QK_block, 1)) # 1 is the axis to find the max along
+        m_ij = tl.maximum(m_i, tl.max(QK_block, 1)) # 1 is the axis to find the max along, so shape is (BLOCK_SIZE_Q)
         # adjust QK block for safe softmax
         QK_block -= m_ij.expand_dims(1)
 
@@ -73,29 +73,31 @@ def _attn_fwd_inner(
         P_block = tl.math.exp(QK_block)
 
         # Compute the sum by rows of the attention scores
-        l_ij = tl.sum(P_block, 1) # 1 is the axis to compute sum along
+        l_ij = tl.sum(P_block, 1) # 1 is the axis to compute sum along, so we get shape (BLOCK_SIZE_Q)
         # This is the correction factor for the previous l_i
-        alpha = tl.math.exp(m_i - m_ij)
+        alpha = tl.math.exp(m_i - m_ij) # shape (BLOCK_SIZE_Q)
         # Apply the correction factor to the previous l_i and add the new l_ij
         l_i = l_i * alpha + l_ij
-
-        V_block = tl.load(V_block_ptr)
-        P_block = P_block.to(tl.float16) # TODO not sure why this op needs to be in fp16; when i tried fp32 it broke
         
         # This computes O_new = P x V + O_old * alpha
+        V_block = tl.load(V_block_ptr) # shape (BLOCK_SIZE_KV, HEAD_DIM)
+        P_block = P_block.to(tl.float16) # TODO not sure why this op needs to be in fp16; when i tried fp32 it broke
         O_block = O_block * alpha.expand_dims(1) # adjusts previous values based on potential new max
         O_block = tl.dot(P_block, V_block, acc=O_block) # accumulated P and V block dot product into O block
+            # so we get shape (BLOCK_SIZE_Q, HEAD_DIM)
+            # notice we're doing this before we've actually divided by our softmax denominator l_i
+            # which is possible because 
 
         m_i = m_ij # sets old max equal to new max, ready to be used by next iteration of for loop
 
-        # Move to the next block of K and V
-        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_SIZE_KV, 0))
-        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_SIZE_KV))
+        # Move to the next block of K and V along the SEQ_LEN dimension
+        V_block_ptrs = tl.advance(V_block_ptr, (BLOCK_SIZE_KV, 0))
+        K_block_ptrs = tl.advance(K_block_ptr, (0, BLOCK_SIZE_KV))
         """
         Here are the above ^ two lines implemented with manual pointers.
-        Remember you can't mix automatic & manual implementations; choose one & stick to it
-        V_block_ptr += BLOCK_SIZE_KV * stride_V_seq
-        K_block_ptr += BLOCK_SIZE_KV * stride_K_seq
+        Remember you can't mix automatic & manual pointer implementations; choose one & stick to it
+        V_block_ptrs += BLOCK_SIZE_KV * stride_V_seq
+        K_block_ptrs += BLOCK_SIZE_KV * stride_K_seq
         """
 
     return O_block, l_i, m_i # we save these three specifically for use later in the backward pass
@@ -155,7 +157,7 @@ def _attn_fwd(
     qkv_offset = index_batch * stride_Q_batch + index_head * stride_Q_head
 
     # so here's a new function that does the math of finding the right pointer for us
-    Q_block_ptr = tl.make_block_ptr(
+    Q_block_ptrs = tl.make_block_ptr(
         base=Q_ptr + qkv_offset, # base pointer to the parent tensor
         shape=(SEQ_LEN, HEAD_DIM), # shape of the parent tensor
             # notice our parent tensor is actually a single splice of the original Q rather than the full Q
@@ -179,7 +181,7 @@ def _attn_fwd(
         # 1. start at the first entry of the (SEQ_LEN,HEAD_DIM matrix),
         # 2. turn the seq_len and head_dim components into 2D tensors to match
         # 3. adjust for stride length in memory
-    Q_block_ptr = Q_ptr + (offsets_Q_seq_len.expand_dims(1) * stride_Q_seq + offsets_Q_head_dim.expand_dims(0) * stride_Q_dim)
+    Q_block_ptrs = Q_ptr + (offsets_Q_seq_len.expand_dims(1) * stride_Q_seq + offsets_Q_head_dim.expand_dims(0) * stride_Q_dim)
     
     HERE'S THE THING:
     when writing a kernel, you have to choose between whether you're going to use make_block_ptr or do it manually.
@@ -188,7 +190,7 @@ def _attn_fwd(
     i am going to be adding in the manual version of each relevant line of code as a comment and reminding you to not mix them
     """
 
-    V_block_ptr = tl.make_block_ptr(
+    V_block_ptrs = tl.make_block_ptr(
         base=V_ptr + qkv_offset,
         shape=(SEQ_LEN, HEAD_DIM),
         strides=(stride_V_seq, stride_V_dim),
@@ -197,14 +199,15 @@ def _attn_fwd(
         order=(1, 0),
     )
     """
-    Here is the above ^ function implemented manually. Remember you can't mix automatic & manual implementations; choose one & stick to it
+    Here is the above ^ function implemented manually. 
+    Remember you can't mix automatic & manual pointer implementations; choose one & stick to it
     V_ptr += qkv_offset
     offsets_V_seq_len = tl.arange(0, BLOCK_SIZE_KV)
     offsets_V_head_dim = tl.arange(0, HEAD_DIM) # TODO should it be triton.next_power_of_2(HEAD_DIM))
-    V_block_ptr = V_ptr + (offsets_V_seq_len.expand_dims(1) * stride_V_seq + offsets_V_head_dim.expand_dims(0) * stride_V_dim)
+    V_block_ptrs = V_ptr + (offsets_V_seq_len.expand_dims(1) * stride_V_seq + offsets_V_head_dim.expand_dims(0) * stride_V_dim)
     #"""
     
-    K_block_ptr = tl.make_block_ptr(
+    K_block_ptrs = tl.make_block_ptr(
         base=K_ptr + qkv_offset,
         shape=(HEAD_DIM, SEQ_LEN), # we transpose K in a fused manner here instead of making an entire separate kernel for transpose
         strides=( # by inverting the strides, we are transposing the matrix
@@ -216,14 +219,15 @@ def _attn_fwd(
         order=(0, 1), # TODO ok why is this order different?
     )
     """
-    Here is the above ^ function implemented manually. Remember you can't mix automatic & manual implementations; choose one & stick to it
+    Here is the above ^ function implemented manually. 
+    Remember you can't mix automatic & manual pointer mplementations; choose one & stick to it
     K_ptr += qkv_offset
     offsets_K_seq_len = tl.arange(0, BLOCK_SIZE_KV)
     offsets_V_head_dim = tl.arange(0, HEAD_DIM)
-    K_block_ptr = K_ptr + (offsets_K_seq_len.expand_dims(0) * stride_V_seq + offsets_V_head_dim.expand_dims(1) * stride_V_dim)
+    K_block_ptrs = K_ptr + (offsets_K_seq_len.expand_dims(0) * stride_V_seq + offsets_V_head_dim.expand_dims(1) * stride_V_dim)
     #"""
 
-    O_block_ptr = tl.make_block_ptr( # this should all look the same as Q
+    O_block_ptrs = tl.make_block_ptr( # this should all look the same as Q
         base=O_ptr + qkv_offset,
         shape=(SEQ_LEN, HEAD_DIM),
         strides=(stride_O_seq, stride_O_dim),
@@ -232,11 +236,12 @@ def _attn_fwd(
         order=(1, 0), # TODO still don't know what order does
     )
     """
-    Here is the above ^ function implemented manually. Remember you can't mix automatic & manual implementations; choose one & stick to it
+    Here is the above ^ function implemented manually. 
+    Remember you can't mix automatic & manual pointer implementations; choose one & stick to it
     O_ptr += qkv_offset
     offsets_O_seq_len = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
     offsets_V_head_dim = tl.arange(0, HEAD_DIM)
-    O_block_ptr = O_ptr + (offsets_O_seq_len.expand_dims(1) * stride_O_seq + offsets_V_head_dim.expand_dims(0) * stride_O_dim)
+    O_block_ptrs = O_ptr + (offsets_O_seq_len.expand_dims(1) * stride_O_seq + offsets_V_head_dim.expand_dims(0) * stride_O_dim)
     #"""
 
     # these next two were calculated internally by calls of make_block_ptr() but not given to us and still needed by us.
@@ -300,14 +305,20 @@ def _attn_fwd(
             SEQ_LEN,
         )
     
-    # This is needed to compute the logsumexp for the backwards pass
+    # This is needed to compute the logsumexp for the backwards pass. basically instead of saving the maxes 
+    #  and the sums separately, we save them together with the += log() and then a trick we'll see later.
     m_i += tl.math.log(l_i)  # l_i was composed using the sum & exp operations in _attn_fwd_inner()
-    # finally using the denominator of our softmax
+        # this will work because softmax(x_i) = exp(x_i - m_i) / l_i 
+        #                                     = exp(x_i - m_i) / exp(log(l_i)) 
+        #                                     = exp(x_i - m_i - log(l_i))
+    
+    # finally dividing by the denominator of our softmax (this was done out-of-order from traditional softmax implementations)
     O_block = O_block / l_i.expand_dims(1) 
+        # we can do this out-of-order since matmul (the tl.dot in _attn_fwd_inner) and entry-wise division are associative TODO
 
     # storing it all back to DRAM
-    m_ptrs = M_ptr + index_batch_head * SEQ_LEN + offsets_q
-    tl.store(m_ptrs, m_i)
+    m_block_ptrs = M_ptr + index_batch_head * SEQ_LEN + offsets_q
+    tl.store(m_block_ptrs, m_i)
     tl.store(O_block_ptr, O_block.to(O_ptr.type.element_ty)) # TODO what's with this type changing stuff?
 
 
@@ -346,8 +357,8 @@ def _attn_bwd_preprocess(
     # Compute the D block
     D_block = tl.sum(dO_block * O_block, axis=1)  # Shape: (BLOCK_SIZE_Q,) so we're summing along HEAD_DIM
     # Store the D block
-    D_block_ptrs = D + index_batch_head * SEQ_LEN + offsets_q
-    tl.store(D_block_ptrs, D_block) # TODO figure out & explain why D is useful
+    D_block_block_ptrs = D + index_batch_head * SEQ_LEN + offsets_q
+    tl.store(D_block_block_ptrs, D_block) # TODO figure out & explain why D is useful
 
 
 @triton.jit
@@ -416,16 +427,16 @@ def _attn_bwd_dq(
     offsets_kv = tl.arange(0, BLOCK_KV)
 
     # We access the K and V as transposed blocks
-    kT_ptrs = K + offsets_kv.expand_dims(0) * stride_seq + offsets_dim.expand_dims(1) * stride_dim
-    vT_ptrs = V + offsets_kv.expand_dims(0) * stride_seq + offsets_dim.expand_dims(1) * stride_dim
+    kT_block_ptrs = K + offsets_kv.expand_dims(0) * stride_seq + offsets_dim.expand_dims(1) * stride_dim
+    vT_block_ptrs = V + offsets_kv.expand_dims(0) * stride_seq + offsets_dim.expand_dims(1) * stride_dim
 
     Di = tl.load(D + offsets_q)
 
     curr_kv = 0
     num_steps = SEQ_LEN // BLOCK_KV
     for blk_idx in range(num_steps):
-        K_T_block = tl.load(kT_ptrs)
-        V_T_block = tl.load(vT_ptrs)
+        K_T_block = tl.load(kT_block_ptrs)
+        V_T_block = tl.load(vT_block_ptrs)
         QK_block = softmax_scale * tl.dot(Q_block, K_T_block)
         P_block = tl.math.exp(QK_block - M_block)
 
@@ -444,11 +455,11 @@ def _attn_bwd_dq(
         dQ_block += softmax_scale * tl.dot(dS_block, tl.trans(K_T_block))
         # Increment pointers.
         curr_kv += BLOCK_KV
-        kT_ptrs += BLOCK_KV * stride_seq
-        vT_ptrs += BLOCK_KV * stride_seq
+        kT_block_ptrs += BLOCK_KV * stride_seq
+        vT_block_ptrs += BLOCK_KV * stride_seq
 
-    dQ_block_ptrs = dQ + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
-    tl.store(dQ_block_ptrs, dQ_block)
+    dQ_block_block_ptrs = dQ + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+    tl.store(dQ_block_block_ptrs, dQ_block)
 
 
 @triton.jit
@@ -520,18 +531,18 @@ def _attn_bwd_dk_dv(
 
     # We access the Q as a transposed array, so that's why we treat offsets_q as a column vector ans offsets_dim as a row vector
     # This is equivalent to doing:
-    # q_ptrs = Q + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
-    # qT_ptrs = tl.trans(q_ptrs)
+    # q_block_ptrs = Q + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+    # qT_block_ptrs = tl.trans(q_block_ptrs)
     # We point to the first BLOCK_Q rows of Q for both the qT and dO pointers, inside the for loop we will move forward by BLOCK_Q rows at each iteration.
-    qT_ptrs = Q + offsets_q.expand_dims(0) * stride_seq + offsets_dim.expand_dims(1) * stride_dim
-    dO_ptrs = dO + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+    qT_block_ptrs = Q + offsets_q.expand_dims(0) * stride_seq + offsets_dim.expand_dims(1) * stride_dim
+    dO_block_ptrs = dO + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
 
     # Iterates over the sequence dimension of the query
     curr_q = 0
     num_steps = SEQ_LEN // BLOCK_Q
     for blk_idx in range(num_steps):
         # Load a block of Q
-        qT_block = tl.load(qT_ptrs)
+        qT_block = tl.load(qT_block_ptrs)
         # Load the logsumexp values for the queries in the current block
         offsets_q = curr_q + tl.arange(0, BLOCK_Q)
         m = tl.load(M + offsets_q)
@@ -551,7 +562,7 @@ def _attn_bwd_dk_dv(
             # In this case we do not need to mask with -Inf before applying the softmax since we already computed the normalization factors (stored in "m")
             P_T_block = tl.where(mask_block, P_T_block, 0.0)
 
-        dO_block = tl.load(dO_ptrs)
+        dO_block = tl.load(dO_block_ptrs)
         # According to the formula: dV_new = dV_old + P^T x dO, where x is the matrix multiplication
         dV_block += tl.dot(P_T_block.to(tl.float16), dO_block)
 
@@ -571,16 +582,16 @@ def _attn_bwd_dk_dv(
         dK_block += softmax_scale * tl.dot(dS_T_block, tl.trans(qT_block))
         # Increment pointers.
         curr_q += BLOCK_Q
-        qT_ptrs += BLOCK_Q * stride_seq
-        dO_ptrs += BLOCK_Q * stride_seq
+        qT_block_ptrs += BLOCK_Q * stride_seq
+        dO_block_ptrs += BLOCK_Q * stride_seq
 
     # Write back dV.
-    dV_block_ptrs = dV + offsets_kv.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
-    tl.store(dV_block_ptrs, dV_block)
+    dV_block_block_ptrs = dV + offsets_kv.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+    tl.store(dV_block_block_ptrs, dV_block)
 
     # Write back dK.
-    dK_block_ptrs = dK + offsets_kv.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
-    tl.store(dK_block_ptrs, dK_block)
+    dK_block_block_ptrs = dK + offsets_kv.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+    tl.store(dK_block_block_ptrs, dK_block)
 
 
 class TritonAttention(torch.autograd.Function):
