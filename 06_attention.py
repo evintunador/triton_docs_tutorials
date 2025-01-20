@@ -325,7 +325,7 @@ def _attn_fwd(
 
 
 @triton.jit
-def _attn_bwd_preprocess(
+def _attn_backward_preprocess(
     O_ptr,
     dO_ptr,
     D_ptr,
@@ -364,7 +364,132 @@ def _attn_bwd_preprocess(
 
 
 @triton.jit
-def _attn_bwd_dq(
+def _attn_backward_dk_dv(
+    Q_ptr, K_ptr, V_ptr, # original input tensor pointers. tensors themselves are shape (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM)
+    softmax_scale,
+    dO_ptr, dQ_ptr, dK_ptr, dV_ptr, # derivative tensor pointers. tensors themselves are shape (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM)
+    M_ptr, D_ptr, # assisting intermediary tensor pointers. tensors themselves are shape (BATCH_SIZE, NUM_HEADS, SEQ_LEN)
+    stride_batch, stride_head, stride_seq, stride_dim,
+    NUM_HEADS, SEQ_LEN,
+    BLOCK_SIZE_Q: tl.constexpr, BLOCK_SIZE_KV: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    STAGE: tl.constexpr,
+):
+    # selecting which pid we are in respect to BATCH_SIZE and NUM_HEADS
+    index_batch_head = tl.program_id(2) # TODO see why do we need a 3D launch grid?!
+    index_batch = index_batch_head // NUM_HEADS # getting the sequence in the batch this pid is assigned to
+    index_head = index_batch_head % NUM_HEADS # getting the head this pid is assigned to
+
+    # This offset allows us to select the right (SEQ_LEN, HEAD_DIM) matrix from a tensor of shape 
+    #  (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM) given the batch and head
+    offset_batch_head = (stride_batch * index_batch + stride_head * index_head).to(tl.int64)
+        # TODO i presume int64 is bc BATCH_SIZE * NUM_HEADS could legitimately exhaust int64's representation range?
+    # The reason we don't access the blocks through the automated method make_block_ptr is because we need to use the range of 
+    #  offsets to apply the masking, meaning there are times when building pointers manually provides more control
+    Q_ptr += offset_batch_head
+    K_ptr += offset_batch_head
+    V_ptr += offset_batch_head
+    dO_ptr += offset_batch_head
+    dQ_ptr += offset_batch_head
+    dK_ptr += offset_batch_head
+    dV_ptr += offset_batch_head
+    
+    # This offset allows us to select the right sequence from a shape (BATCH_SIZE, NUM_HEADS, SEQ_LEN) tensor given the batch and head.
+    offset_batch_head_seq = (index_batch_head * SEQ_LEN).to(tl.int64)
+    # Make sure the pointers of intermediary tensors are in the right place w.r.t batch, head and sequence
+    M_ptr += offset_batch_head_seq
+    D_ptr += offset_batch_head_seq
+
+    # load scales
+    offsets_dim = tl.arange(0, HEAD_DIM)
+
+    index_block_kv = tl.program_id(0)
+    offsets_kv = index_block_kv * BLOCK_SIZE_KV + tl.arange(0, BLOCK_SIZE_KV)
+
+    # initializing zero-filled tensors we'll accumulate gradients into
+    dV_block = tl.zeros([BLOCK_SIZE_KV, HEAD_DIM], dtype=tl.float32)
+    dK_block = tl.zeros([BLOCK_SIZE_KV, HEAD_DIM], dtype=tl.float32)
+
+    # load K and V: they stay in SRAM throughout the inner loop.
+    K_block = tl.load(
+        K_ptr + offsets_kv.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+    )  # Shape: (BLOCK_SIZE_KV1, HEAD_DIM) TODO why the 1?
+    V_block = tl.load(
+        V_ptr + offsets_kv.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+    )  # Shape: (BLOCK_SIZE_KV1, HEAD_DIM)
+
+    offsets_q = tl.arange(0, BLOCK_SIZE_Q)
+
+    # We access the Q as a transposed array, so that's why we treat offsets_q as a column vector and offsets_dim as a row vector
+    # This is equivalent to doing:
+    # q_block_ptrs = Q + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+    # qT_block_ptrs = tl.trans(q_block_ptrs)
+    # We point to the first BLOCK_SIZE_Q rows of Q for both the qT and dO pointers, inside the for loop we will 
+    #  move forward by BLOCK_SIZE_Q rows at each iteration.
+    qT_block_ptrs = Q_ptr + offsets_q.expand_dims(0) * stride_seq + offsets_dim.expand_dims(1) * stride_dim
+    dO_block_ptrs = dO_ptr + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+
+    # Iterates over the sequence dimension of the query
+    curr_q = 0
+    num_steps = SEQ_LEN // BLOCK_SIZE_Q
+    for blk_idx in range(num_steps): # TODO clean up this range definition & the curr_q increment below
+        # Load a block of Q
+        qT_block = tl.load(qT_block_ptrs)
+        # Load the logsumexp values for the queries in the current block
+        offsets_q = curr_q + tl.arange(0, BLOCK_SIZE_Q)
+        m = tl.load(M_ptr + offsets_q)
+
+        # This gives us (QK^T)^T = (K^T)^T(Q^T) = K(Q^T) = P^T
+        QK_T_block = softmax_scale * tl.dot(K_block, qT_block)
+            # notice we're actually re-computing part of teh forward pass here when we could've isntead saved it
+            #  into DRAM for use now. That would've required fewer FLOPs but doing it this way means we never
+            #  have to save the huge (SEQ_LEN, SEQ_LEN) matrices into DRAM, which is well worth the FLOP hit
+        # We apply the softmax by using the logsumexp trick
+        P_T_block = tl.math.exp(QK_T_block - m.expand_dims(0))
+
+        if STAGE == 3:
+            # Autoregressive masking.
+            # mask is True for all values that DO NOT need to be masked
+            #  meaning False for all values that DO need to me masked
+            mask_block = offsets_q.expand_dims(0) >= offsets_kv.expand_dims(1) # Shape: (BLOCK_KV1, BLOCK_Q1)
+            # Replace all the masked (False) values with 0.
+            # In this case we do not need to mask with -inf before applying the softmax since we already computed the normalization factors (stored in "m")
+            P_T_block = tl.where(mask_block, P_T_block, 0.0)
+
+        dO_block = tl.load(dO_block_ptrs)
+        # According to the formula: dV_new = dV_old + P^T x dO, where x is the matrix multiplication
+        dV_block += tl.dot(P_T_block.to(tl.float16), dO_block)
+
+        # Delta = rowsum(O * dO) where * is the element-wise product
+        Di = tl.load(D_ptr + offsets_q)
+
+        # dP = dO x V^T, so dP^T = V x dO^T
+        # Where x is the matrix multiplication
+        dpT_block = tl.dot(V_block, tl.trans(dO_block)).to(tl.float32)
+
+        # We know that dS = P * (dP - Delta), so dS^T = P^T * (dP^T - Delta^T)
+
+        dS_T_block = P_T_block * (dpT_block - Di.expand_dims(0))
+        dS_T_block = dS_T_block.to(tl.float16)
+
+        # According to the formula on the paper: dK_new = dK_old + dS^T x Q
+        dK_block += softmax_scale * tl.dot(dS_T_block, tl.trans(qT_block))
+        # Increment pointers.
+        curr_q += BLOCK_SIZE_Q
+        qT_block_ptrs += BLOCK_SIZE_Q * stride_seq
+        dO_block_ptrs += BLOCK_SIZE_Q * stride_seq
+
+    # Write back dV.
+    dV_block_ptrs = dV_ptr + offsets_kv.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+    tl.store(dV_block_ptrs, dV_block)
+
+    # Write back dK.
+    dK_block_ptrs = dK_ptr + offsets_kv.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+    tl.store(dK_block_ptrs, dK_block)
+
+
+@triton.jit
+def _attn_backward_dq(
     Q,
     K,
     V,
@@ -462,138 +587,6 @@ def _attn_bwd_dq(
 
     dQ_block_block_ptrs = dQ + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
     tl.store(dQ_block_block_ptrs, dQ_block)
-
-
-@triton.jit
-def _attn_bwd_dk_dv(
-    Q,
-    K,
-    V,
-    softmax_scale,
-    dO,
-    dQ,
-    dK,
-    dV,
-    M,
-    D,
-    stride_batch,
-    stride_head,
-    stride_seq,
-    stride_dim,
-    NUM_HEADS,
-    SEQ_LEN,
-    BLOCK_Q: tl.constexpr,
-    BLOCK_KV: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    STAGE: tl.constexpr,
-):
-    index_batch_head = tl.program_id(2)
-    index_batch = index_batch_head // NUM_HEADS
-    index_head = index_batch_head % NUM_HEADS
-    offset_batch_head = (stride_batch * index_batch + stride_head * index_head).to(
-        tl.int64
-    )
-    # This is the offset that allows us to select the right sequence given the batch and head.
-    offset_batch_head_seq = (index_batch_head * SEQ_LEN).to(tl.int64)
-
-    # Make sure the pointers are in the right place w.r.t batch and head
-    # The reason we don't access the blocks through make_block_ptr is because we need to use the range of offsets to apply the masking
-    Q += offset_batch_head
-    K += offset_batch_head
-    V += offset_batch_head
-    dO += offset_batch_head
-    dQ += offset_batch_head
-    dK += offset_batch_head
-    dV += offset_batch_head
-
-    # Make sure the pointers are in the right place w.r.t batch, head and sequence
-    M += offset_batch_head_seq
-    D += offset_batch_head_seq
-
-    # load scales
-    offsets_dim = tl.arange(0, HEAD_DIM)
-
-    index_block_kv = tl.program_id(0)
-    start_kv = index_block_kv * BLOCK_KV
-
-    offsets_kv = start_kv + tl.arange(0, BLOCK_KV)
-
-    dV_block = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
-    dK_block = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
-
-    # load K and V: they stay in SRAM throughout the inner loop.
-    K_block = tl.load(
-        K + offsets_kv.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
-    )  # Shape: (BLOCK_KV1, HEAD_DIM)
-    V_block = tl.load(
-        V + offsets_kv.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
-    )  # Shape: (BLOCK_KV1, HEAD_DIM)
-
-    offsets_q = tl.arange(0, BLOCK_Q)
-
-    # We access the Q as a transposed array, so that's why we treat offsets_q as a column vector ans offsets_dim as a row vector
-    # This is equivalent to doing:
-    # q_block_ptrs = Q + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
-    # qT_block_ptrs = tl.trans(q_block_ptrs)
-    # We point to the first BLOCK_Q rows of Q for both the qT and dO pointers, inside the for loop we will move forward by BLOCK_Q rows at each iteration.
-    qT_block_ptrs = Q + offsets_q.expand_dims(0) * stride_seq + offsets_dim.expand_dims(1) * stride_dim
-    dO_block_ptrs = dO + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
-
-    # Iterates over the sequence dimension of the query
-    curr_q = 0
-    num_steps = SEQ_LEN // BLOCK_Q
-    for blk_idx in range(num_steps):
-        # Load a block of Q
-        qT_block = tl.load(qT_block_ptrs)
-        # Load the logsumexp values for the queries in the current block
-        offsets_q = curr_q + tl.arange(0, BLOCK_Q)
-        m = tl.load(M + offsets_q)
-
-        # This gives us (QK^T)^T = (K^T)^T(Q^T) = K(Q^T) = P^T
-        QK_T_block = softmax_scale * tl.dot(K_block, qT_block)
-        # We apply the softmax by using the logsumexp trick
-        P_T_block = tl.math.exp(QK_T_block - m.expand_dims(0))
-
-        if STAGE == 3:
-            # Autoregressive masking.
-            # mask is True for all values that DO NOT NEED TO BE MASKED
-            mask_block = (
-                offsets_q.expand_dims(0) >= offsets_kv.expand_dims(1)
-            )  # Shape: (BLOCK_KV1, BLOCK_Q1)
-            # Replace all the masked values with 0.
-            # In this case we do not need to mask with -Inf before applying the softmax since we already computed the normalization factors (stored in "m")
-            P_T_block = tl.where(mask_block, P_T_block, 0.0)
-
-        dO_block = tl.load(dO_block_ptrs)
-        # According to the formula: dV_new = dV_old + P^T x dO, where x is the matrix multiplication
-        dV_block += tl.dot(P_T_block.to(tl.float16), dO_block)
-
-        # Delta = rowsum(O * dO) where * is the element-wise product
-        Di = tl.load(D + offsets_q)
-
-        # dP = dO x V^T, so dP^T = V x dO^T
-        # Where x is the matrix multiplication
-        dpT_block = tl.dot(V_block, tl.trans(dO_block)).to(tl.float32)
-
-        # We know that dS = P * (dP - Delta), so dS^T = P^T * (dP^T - Delta^T)
-
-        dS_T_block = P_T_block * (dpT_block - Di.expand_dims(0))
-        dS_T_block = dS_T_block.to(tl.float16)
-
-        # According to the formula on the paper: dK_new = dK_old + dS^T x Q
-        dK_block += softmax_scale * tl.dot(dS_T_block, tl.trans(qT_block))
-        # Increment pointers.
-        curr_q += BLOCK_Q
-        qT_block_ptrs += BLOCK_Q * stride_seq
-        dO_block_ptrs += BLOCK_Q * stride_seq
-
-    # Write back dV.
-    dV_block_block_ptrs = dV + offsets_kv.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
-    tl.store(dV_block_block_ptrs, dV_block)
-
-    # Write back dK.
-    dK_block_block_ptrs = dK + offsets_kv.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
-    tl.store(dK_block_block_ptrs, dK_block)
 
 
 class TritonAttention(torch.autograd.Function):
@@ -699,7 +692,7 @@ class TritonAttention(torch.autograd.Function):
             # TODO why do we call it D? what's its purpose?
 
         # Compute all the elements Di
-        _attn_bwd_preprocess[preprocess_grid](
+        _attn_backward_preprocess[preprocess_grid](
             O_ptr=O, dO_ptr=dO, D_ptr=D,
             SEQ_LEN=SEQ_LEN,
             BLOCK_SIZE_Q=BLOCK_SIZE_MACRO,
@@ -714,33 +707,21 @@ class TritonAttention(torch.autograd.Function):
 
         # Fix KV and iterate through all the Q blocks
             # TODO what do we mean by "fix"?
-        _attn_bwd_dk_dv[grid](
-            Q=Q,
-            K=K,
-            V=V,
+        _attn_backward_dk_dv[grid](
+            Q_ptr=Q, K_ptr=K, V_ptr=V,
             softmax_scale=ctx.softmax_scale,
-            dO=dO,
-            dQ=dQ,
-            dK=dK,
-            dV=dV,
-            M=M,
-            D=D,
-            stride_batch=Q.stride(0),
-            stride_head=Q.stride(1),
-            stride_seq=Q.stride(2),
-            stride_dim=Q.stride(3),
-            NUM_HEADS=NUM_HEADS,
-            SEQ_LEN=SEQ_LEN,
-            BLOCK_Q=BLOCK_SIZE_MICRO,
-            BLOCK_KV=BLOCK_SIZE_MACRO,
+            dO_ptr=dO, dQ_ptr=dQ, dK_ptr=dK, dV_ptr=dV,
+            M_ptr=M, D_ptr=D,
+            stride_batch=Q.stride(0), stride_head=Q.stride(1), stride_seq=Q.stride(2), stride_dim=Q.stride(3),
+            NUM_HEADS=NUM_HEADS, SEQ_LEN=SEQ_LEN,
+            BLOCK_SIZE_Q=BLOCK_SIZE_MICRO, BLOCK_SIZE_KV=BLOCK_SIZE_MACRO,
             HEAD_DIM=ctx.HEAD_DIM,
-            STAGE=stage,
-            num_warps=NUM_WARPS,
-            num_stages=NUM_STAGES,
+            STAGE=stage, # TODO see using STAGE is confusing AF when pytorch already has num_stages
+            num_warps=NUM_WARPS, num_stages=NUM_STAGES,
         )
 
         # Fix Q and iterate through all the KV block
-        _attn_bwd_dq[grid](
+        _attn_backward_dq[grid]( # TODO if using the same launch grid here, why not combine? waiting for sync?
             Q=Q,
             K=K,
             V=V,
