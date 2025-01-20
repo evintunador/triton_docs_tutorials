@@ -490,24 +490,24 @@ def _attn_backward_dk_dv(
 
 @triton.jit
 def _attn_backward_dq(
-    Q,
-    K,
-    V,
+    Q_ptr,
+    K_ptr,
+    V_ptr,
     softmax_scale,
-    dO,
-    dQ,
-    dK,
-    dV,
-    M,
-    D,
+    dO_ptr,
+    dQ_ptr,
+    dK_ptr,
+    dV_ptr,
+    M_ptr,
+    D_ptr,
     stride_batch,
     stride_head,
     stride_seq,
     stride_dim,
     NUM_HEADS,
     SEQ_LEN,
-    BLOCK_Q: tl.constexpr,
-    BLOCK_KV: tl.constexpr,
+    BLOCK_SIZE_Q: tl.constexpr,
+    BLOCK_SIZE_KV: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     STAGE: tl.constexpr,
 ):
@@ -522,45 +522,45 @@ def _attn_backward_dq(
 
     # Make sure the pointers are in the right place w.r.t batch and head
     # The reason we don't access the blocks through make_block_ptr is because we need to use the range of offsets to apply the masking
-    Q += offset_batch_head
-    K += offset_batch_head
-    V += offset_batch_head
-    dO += offset_batch_head
-    dQ += offset_batch_head
-    dK += offset_batch_head
-    dV += offset_batch_head
+    Q_ptr += offset_batch_head
+    K_ptr += offset_batch_head
+    V_ptr += offset_batch_head
+    dO_ptr += offset_batch_head
+    dQ_ptr += offset_batch_head
+    dK_ptr += offset_batch_head
+    dV_ptr += offset_batch_head
 
     # Make sure the pointers are in the right place w.r.t batch, head and sequence
-    M += offset_batch_head_seq
-    D += offset_batch_head_seq
+    M_ptr += offset_batch_head_seq
+    D_ptr += offset_batch_head_seq
 
     # load scales
     offsets_dim = tl.arange(0, HEAD_DIM)
 
     index_block_kv = tl.program_id(0)
 
-    start_q = index_block_kv * BLOCK_Q
-    offsets_q = start_q + tl.arange(0, BLOCK_Q)
+    start_q = index_block_kv * BLOCK_SIZE_Q
+    offsets_q = start_q + tl.arange(0, BLOCK_SIZE_Q)
 
-    Q_block = tl.load(Q + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim)
-    dQ_block = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
+    Q_block = tl.load(Q_ptr + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim)
+    dQ_block = tl.zeros([BLOCK_SIZE_Q, HEAD_DIM], dtype=tl.float32)
     dO_block = tl.load(
-        dO + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+        dO_ptr + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
     )
 
-    M_block = tl.load(M + offsets_q)
+    M_block = tl.load(M_ptr + offsets_q)
     M_block = M_block.expand_dims(1)
 
-    offsets_kv = tl.arange(0, BLOCK_KV)
+    offsets_kv = tl.arange(0, BLOCK_SIZE_KV)
 
     # We access the K and V as transposed blocks
-    kT_block_ptrs = K + offsets_kv.expand_dims(0) * stride_seq + offsets_dim.expand_dims(1) * stride_dim
-    vT_block_ptrs = V + offsets_kv.expand_dims(0) * stride_seq + offsets_dim.expand_dims(1) * stride_dim
+    kT_block_ptrs = K_ptr + offsets_kv.expand_dims(0) * stride_seq + offsets_dim.expand_dims(1) * stride_dim
+    vT_block_ptrs = V_ptr + offsets_kv.expand_dims(0) * stride_seq + offsets_dim.expand_dims(1) * stride_dim
 
-    Di = tl.load(D + offsets_q)
+    Di = tl.load(D_ptr + offsets_q)
 
     curr_kv = 0
-    num_steps = SEQ_LEN // BLOCK_KV
+    num_steps = SEQ_LEN // BLOCK_SIZE_KV
     for blk_idx in range(num_steps):
         K_T_block = tl.load(kT_block_ptrs)
         V_T_block = tl.load(vT_block_ptrs)
@@ -569,7 +569,7 @@ def _attn_backward_dq(
 
         if STAGE == 3:
             # Autoregressive masking.
-            offsets_kv = curr_kv + tl.arange(0, BLOCK_KV)
+            offsets_kv = curr_kv + tl.arange(0, BLOCK_SIZE_KV)
             mask_block = offsets_q.expand_dims(1) >= offsets_kv.expand_dims(0)
             P_block = tl.where(mask_block, P_block, 0.0)
 
@@ -581,11 +581,11 @@ def _attn_backward_dq(
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         dQ_block += softmax_scale * tl.dot(dS_block, tl.trans(K_T_block))
         # Increment pointers.
-        curr_kv += BLOCK_KV
-        kT_block_ptrs += BLOCK_KV * stride_seq
-        vT_block_ptrs += BLOCK_KV * stride_seq
+        curr_kv += BLOCK_SIZE_KV
+        kT_block_ptrs += BLOCK_SIZE_KV * stride_seq
+        vT_block_ptrs += BLOCK_SIZE_KV * stride_seq
 
-    dQ_block_block_ptrs = dQ + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+    dQ_block_block_ptrs = dQ_ptr + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
     tl.store(dQ_block_block_ptrs, dQ_block)
 
 
@@ -722,31 +722,20 @@ class TritonAttention(torch.autograd.Function):
 
         # Fix Q and iterate through all the KV block
         _attn_backward_dq[grid]( # TODO if using the same launch grid here, why not combine? waiting for sync?
-            Q=Q,
-            K=K,
-            V=V,
+            Q_ptr=Q, K_ptr=K, V_ptr=V,
             softmax_scale=ctx.softmax_scale,
-            dO=dO,
-            dQ=dQ,
-            dK=dK,
-            dV=dV,
-            M=M,
-            D=D,
-            stride_batch=Q.stride(0),
-            stride_head=Q.stride(1),
-            stride_seq=Q.stride(2),
-            stride_dim=Q.stride(3),
-            NUM_HEADS=NUM_HEADS,
-            SEQ_LEN=SEQ_LEN,
-            BLOCK_Q=BLOCK_SIZE_MACRO,
-            BLOCK_KV=BLOCK_SIZE_MICRO,
-            HEAD_DIM=ctx.HEAD_DIM,
-            STAGE=stage,
-            num_warps=NUM_WARPS,
-            num_stages=NUM_STAGES,
+            dO_ptr=dO, dQ_ptr=dQ, dK_ptr=dK, dV_ptr=dV,
+            M_ptr=M, D_ptr=D,
+            stride_batch=Q.stride(0), stride_head=Q.stride(1), stride_seq=Q.stride(2), stride_dim=Q.stride(3),
+            NUM_HEADS=NUM_HEADS, SEQ_LEN=SEQ_LEN,
+            BLOCK_SIZE_Q=BLOCK_SIZE_MACRO, BLOCK_SIZE_KV=BLOCK_SIZE_MICRO,
+            HEAD_DIM=ctx.HEAD_DIM, # TODO again why we using ctx again?
+            STAGE=stage, # TODO see using STAGE is confusing AF when pytorch already has num_stages
+            num_warps=NUM_WARPS, num_stages=NUM_STAGES,
         )
 
-        return dQ, dK, dV, None, None
+        # the None's are because pytorch expects a gradient for every input into .forward(), or a None if not applicable
+        return dQ, dK, dV, None, None 
 
 
 def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float16):
