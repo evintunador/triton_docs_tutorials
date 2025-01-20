@@ -1,6 +1,8 @@
 """
-this is a slightly incomplete flash-attention implemenentation implemented by
+this is an edit of the flash-attention implemenentations from
 https://github.com/hkproj/triton-flash-attention
+and
+https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html#sphx-glr-getting-started-tutorials-06-fused-attention-py
 """
 
 import torch
@@ -321,26 +323,31 @@ def _attn_bwd_preprocess(
     block_index_q = tl.program_id(0)
     offsets_q = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
     index_batch_head = tl.program_id(1)
-    offs_dim = tl.arange(0, HEAD_DIM)
+    offsets_dim = tl.arange(0, HEAD_DIM)
+
+    """
+    TODO wouldn't we normally need to incorporate strides here?
+    i suppose HEAD_DIM and SEQ_LEN are acting like strides since we know that dO is contiguous? is that why?
+    """
     # Load a single block of BLOCK_SIZE_Q rows of O
     O_block = tl.load(
         O
         + index_batch_head * HEAD_DIM * SEQ_LEN
         + offsets_q.expand_dims(1) * HEAD_DIM
-        + offs_dim.expand_dims(0)
+        + offsets_dim.expand_dims(0)
     )
     # Load a single block of BLOCK_SIZE_Q rows of dO
-    dO_block = tl.load(
+    dO_block = tl.load( # TODO wouldn't we normally need to incorporate strides here?
         dO
         + index_batch_head * HEAD_DIM * SEQ_LEN
         + offsets_q.expand_dims(1) * HEAD_DIM
-        + offs_dim.expand_dims(0)
-    ).to(tl.float32)
+        + offsets_dim.expand_dims(0)
+    ).to(tl.float32) # TODO why does this one get sent to float32 but not O_block? store tensors in 16 but grads in 32?
     # Compute the D block
-    D_block = tl.sum(dO_block * O_block, axis=1)  # Shape: (BLOCK_SIZE_Q,)
+    D_block = tl.sum(dO_block * O_block, axis=1)  # Shape: (BLOCK_SIZE_Q,) so we're summing along HEAD_DIM
     # Store the D block
     D_block_ptrs = D + index_batch_head * SEQ_LEN + offsets_q
-    tl.store(D_block_ptrs, D_block)
+    tl.store(D_block_ptrs, D_block) # TODO figure out & explain why D is useful
 
 
 @triton.jit
@@ -390,17 +397,17 @@ def _attn_bwd_dq(
     D += offset_batch_head_seq
 
     # load scales
-    offs_dim = tl.arange(0, HEAD_DIM)
+    offsets_dim = tl.arange(0, HEAD_DIM)
 
     index_block_kv = tl.program_id(0)
 
     start_q = index_block_kv * BLOCK_Q
     offsets_q = start_q + tl.arange(0, BLOCK_Q)
 
-    Q_block = tl.load(Q + offsets_q.expand_dims(1) * stride_seq + offs_dim.expand_dims(0) * stride_dim)
+    Q_block = tl.load(Q + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim)
     dQ_block = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
     dO_block = tl.load(
-        dO + offsets_q.expand_dims(1) * stride_seq + offs_dim.expand_dims(0) * stride_dim
+        dO + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
     )
 
     M_block = tl.load(M + offsets_q)
@@ -409,8 +416,8 @@ def _attn_bwd_dq(
     offsets_kv = tl.arange(0, BLOCK_KV)
 
     # We access the K and V as transposed blocks
-    kT_ptrs = K + offsets_kv.expand_dims(0) * stride_seq + offs_dim.expand_dims(1) * stride_dim
-    vT_ptrs = V + offsets_kv.expand_dims(0) * stride_seq + offs_dim.expand_dims(1) * stride_dim
+    kT_ptrs = K + offsets_kv.expand_dims(0) * stride_seq + offsets_dim.expand_dims(1) * stride_dim
+    vT_ptrs = V + offsets_kv.expand_dims(0) * stride_seq + offsets_dim.expand_dims(1) * stride_dim
 
     Di = tl.load(D + offsets_q)
 
@@ -440,7 +447,7 @@ def _attn_bwd_dq(
         kT_ptrs += BLOCK_KV * stride_seq
         vT_ptrs += BLOCK_KV * stride_seq
 
-    dQ_block_ptrs = dQ + offsets_q.expand_dims(1) * stride_seq + offs_dim.expand_dims(0) * stride_dim
+    dQ_block_ptrs = dQ + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
     tl.store(dQ_block_ptrs, dQ_block)
 
 
@@ -491,7 +498,7 @@ def _attn_bwd_dk_dv(
     D += offset_batch_head_seq
 
     # load scales
-    offs_dim = tl.arange(0, HEAD_DIM)
+    offsets_dim = tl.arange(0, HEAD_DIM)
 
     index_block_kv = tl.program_id(0)
     start_kv = index_block_kv * BLOCK_KV
@@ -503,21 +510,21 @@ def _attn_bwd_dk_dv(
 
     # load K and V: they stay in SRAM throughout the inner loop.
     K_block = tl.load(
-        K + offsets_kv.expand_dims(1) * stride_seq + offs_dim.expand_dims(0) * stride_dim
+        K + offsets_kv.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
     )  # Shape: (BLOCK_KV1, HEAD_DIM)
     V_block = tl.load(
-        V + offsets_kv.expand_dims(1) * stride_seq + offs_dim.expand_dims(0) * stride_dim
+        V + offsets_kv.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
     )  # Shape: (BLOCK_KV1, HEAD_DIM)
 
     offsets_q = tl.arange(0, BLOCK_Q)
 
-    # We access the Q as a transposed array, so that's why we treat offsets_q as a column vector ans offs_dim as a row vector
+    # We access the Q as a transposed array, so that's why we treat offsets_q as a column vector ans offsets_dim as a row vector
     # This is equivalent to doing:
-    # q_ptrs = Q + offsets_q.expand_dims(1) * stride_seq + offs_dim.expand_dims(0) * stride_dim
+    # q_ptrs = Q + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
     # qT_ptrs = tl.trans(q_ptrs)
     # We point to the first BLOCK_Q rows of Q for both the qT and dO pointers, inside the for loop we will move forward by BLOCK_Q rows at each iteration.
-    qT_ptrs = Q + offsets_q.expand_dims(0) * stride_seq + offs_dim.expand_dims(1) * stride_dim
-    dO_ptrs = dO + offsets_q.expand_dims(1) * stride_seq + offs_dim.expand_dims(0) * stride_dim
+    qT_ptrs = Q + offsets_q.expand_dims(0) * stride_seq + offsets_dim.expand_dims(1) * stride_dim
+    dO_ptrs = dO + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
 
     # Iterates over the sequence dimension of the query
     curr_q = 0
@@ -568,11 +575,11 @@ def _attn_bwd_dk_dv(
         dO_ptrs += BLOCK_Q * stride_seq
 
     # Write back dV.
-    dV_block_ptrs = dV + offsets_kv.expand_dims(1) * stride_seq + offs_dim.expand_dims(0) * stride_dim
+    dV_block_ptrs = dV + offsets_kv.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
     tl.store(dV_block_ptrs, dV_block)
 
     # Write back dK.
-    dK_block_ptrs = dK + offsets_kv.expand_dims(1) * stride_seq + offs_dim.expand_dims(0) * stride_dim
+    dK_block_ptrs = dK + offsets_kv.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
     tl.store(dK_block_ptrs, dK_block)
 
 
@@ -586,8 +593,9 @@ class TritonAttention(torch.autograd.Function):
         softmax_scale # float, almost always 1/sqrt(head_dim)
     ):
         BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape
-            # TODO at least so far it doesn't seem like we account for MQA
         assert HEAD_DIM == K.shape[-1] and HEAD_DIM == V.shape[-1]
+            # our implementation assumes number of query heads is the same as number of key & value heads,
+            #  meaning it only supports multi-head-attention and not multi-query attention
 
         # pre-allocate output tensor O
         O = torch.empty_like(Q) # output tensor will be pre head concatenation and mixing
@@ -643,21 +651,39 @@ class TritonAttention(torch.autograd.Function):
         return O
 
     @staticmethod
-    def backward(ctx, dO):
+    def backward(ctx, dO): # dO is the derivative of the loss function with respect to the output of the forward method
+        """
+        one of the optimizations flash-attention makes involves not saving all forward-pass information 
+        in order to avoid storing it in DRAM, so now in the backward-pass we'll have to re-compute some of
+        that information. Although this does involve redundant calculations and therefore hamper runtime,
+        it's worth it in terms of how much DRAM we're waving which will effectively allow us to use a larger
+        and therefore more capable model
+        """
+        # grabbing the saved forward pass info
         Q, K, V, O, M = ctx.saved_tensors
 
-        assert dO.is_contiguous()
+        # indexing is easier if all the entries in dO are lined up cleanly in DRAM as opposed to spotted around
+        assert dO.is_contiguous() 
         assert Q.stride() == K.stride() == V.stride() == O.stride() == dO.stride()
+
+        # pre-allocating our eventual output gradients
         dQ = torch.empty_like(Q)
         dK = torch.empty_like(K)
         dV = torch.empty_like(V)
 
-        BATCH_SIZE, NUM_HEADS, SEQ_LEN = Q.shape[:3]
-        NUM_WARPS, NUM_STAGES = 4, 3
-        BLOCK_SIZE_MICRO, BLOCK_SIZE_MACRO = 32, 128
+        BATCH_SIZE, NUM_HEADS, SEQ_LEN = Q.shape[:3] 
+            # TODO why do we use ctx.HEAD_DIM instead of getting it here? is it because of the tl.constexpr?
 
+        # heuristic meta-parameters that we could've used an autotune on when defining the kernel instead
+        NUM_WARPS, NUM_STAGES = 4, 3 
+        BLOCK_SIZE_MICRO, BLOCK_SIZE_MACRO = 32, 128
+            # TODO switch this to auto-tune?
+
+        # so as usual we combine batch_size & num_heads along the same parallelization axis.
+        # and here our preprocessing will also within the sequence length
         preprocess_grid = (SEQ_LEN // BLOCK_SIZE_MACRO, BATCH_SIZE * NUM_HEADS)
         D = torch.empty_like(M)  # Shape: (BATCH_SIZE, NUM_HEADS, SEQ_LEN)
+            # TODO why do we call it D? what's its purpose?
 
         # Compute all the elements Di
         _attn_bwd_preprocess[preprocess_grid](
@@ -666,7 +692,7 @@ class TritonAttention(torch.autograd.Function):
             D=D,
             SEQ_LEN=SEQ_LEN,
             BLOCK_SIZE_Q=BLOCK_SIZE_MACRO,
-            HEAD_DIM=ctx.HEAD_DIM,
+            HEAD_DIM=ctx.HEAD_DIM, # TODO why do we use the one from ctx instead of grabbing it above?
         )
 
         grid = (SEQ_LEN // BLOCK_SIZE_MACRO, 1, BATCH_SIZE * NUM_HEADS)
