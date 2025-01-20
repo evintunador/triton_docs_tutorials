@@ -17,8 +17,8 @@ def _attn_fwd_inner(
     l_i,
     m_i,
     Q_block,
-    K_block_ptr,
-    V_block_ptr,
+    K_block_ptrs,
+    V_block_ptrs,
     block_index_q,
     softmax_scale,
     #stride_K_seq, # if you go for a manual pointer implementation then you'll need to pass in these strides.
@@ -41,8 +41,8 @@ def _attn_fwd_inner(
     else: # runs on every single block for the case that we're not using a causal mask
         lo, hi = 0, SEQ_LEN
 
-    K_block_ptrs = tl.advance(K_block_ptr, (0, lo))
-    V_block_ptrs = tl.advance(V_block_ptr, (lo, 0))
+    K_block_ptrs = tl.advance(K_block_ptrs, (0, lo))
+    V_block_ptrs = tl.advance(V_block_ptrs, (lo, 0))
     """
     Here are the above ^ two lines implemented with manual pointers.
     Remember you can't mix automatic & manual pointer implementations; choose one & stick to it
@@ -57,7 +57,7 @@ def _attn_fwd_inner(
             # TODO what exactly is this optimizing? need to know that in order to know when to use it
 
         # compute (Q @ K^T) / sqrt{head_dim}
-        K_block = tl.load(K_block_ptr)
+        K_block = tl.load(K_block_ptrs)
         QK_block = tl.dot(Q_block, K_block) * softmax_scale # becomes shape (BLOCK_SIZE_Q, BLOCK_SIZE_KV)
 
         if CAUSAL and DIAGONAL: # if causal mask and we're currently on a block containing the diagonal
@@ -80,19 +80,19 @@ def _attn_fwd_inner(
         l_i = l_i * alpha + l_ij
         
         # This computes O_new = P x V + O_old * alpha
-        V_block = tl.load(V_block_ptr) # shape (BLOCK_SIZE_KV, HEAD_DIM)
+        V_block = tl.load(V_block_ptrs) # shape (BLOCK_SIZE_KV, HEAD_DIM)
         P_block = P_block.to(tl.float16) # TODO not sure why this op needs to be in fp16; when i tried fp32 it broke
         O_block = O_block * alpha.expand_dims(1) # adjusts previous values based on potential new max
         O_block = tl.dot(P_block, V_block, acc=O_block) # accumulated P and V block dot product into O block
             # so we get shape (BLOCK_SIZE_Q, HEAD_DIM)
             # notice we're doing this before we've actually divided by our softmax denominator l_i
-            # which is possible because 
+            # which is possible because TODO
 
         m_i = m_ij # sets old max equal to new max, ready to be used by next iteration of for loop
 
         # Move to the next block of K and V along the SEQ_LEN dimension
-        V_block_ptrs = tl.advance(V_block_ptr, (BLOCK_SIZE_KV, 0))
-        K_block_ptrs = tl.advance(K_block_ptr, (0, BLOCK_SIZE_KV))
+        V_block_ptrs = tl.advance(V_block_ptrs, (BLOCK_SIZE_KV, 0))
+        K_block_ptrs = tl.advance(K_block_ptrs, (0, BLOCK_SIZE_KV))
         """
         Here are the above ^ two lines implemented with manual pointers.
         Remember you can't mix automatic & manual pointer implementations; choose one & stick to it
@@ -259,7 +259,7 @@ def _attn_fwd(
     O_block = tl.zeros([BLOCK_SIZE_Q, HEAD_DIM], dtype=tl.float32)
 
     # load the blocks of Q: it will stay in SRAM throughout
-    Q_block = tl.load(Q_block_ptr)
+    Q_block = tl.load(Q_block_ptrs) # shape (BLOCK_SIZE_Q, HEAD_DIM)
 
     # calculate attention for dense blocks (those where the mask if full of 1's). This step runs for 
     # the entirety of non-causal attention and for the blocks below the diagonal in causal attention
@@ -268,8 +268,8 @@ def _attn_fwd(
         l_i,
         m_i,
         Q_block,
-        K_block_ptr,
-        V_block_ptr,
+        K_block_ptrs,
+        V_block_ptrs,
         block_index_q,
         softmax_scale,
         #stride_K_seq, # if you go for a manual pointer implementation then you'll need to pass in these strides.
@@ -283,15 +283,14 @@ def _attn_fwd(
         SEQ_LEN,
     )
 
-    if CAUSAL: # we need to treat blocks on the diagonal different from those below it
-        # This step runs for the blocks on the diagonal in the causal attention
+    if CAUSAL: # This step runs for the blocks on the diagonal in the causal attention mask
         O_block, l_i, m_i = _attn_fwd_inner(
             O_block,
             l_i,
             m_i,
             Q_block,
-            K_block_ptr,
-            V_block_ptr,
+            K_block_ptrs,
+            V_block_ptrs,
             block_index_q,
             softmax_scale,
             #stride_K_seq, # if you go for a manual pointer implementation then you'll need to pass in these strides.
@@ -312,21 +311,24 @@ def _attn_fwd(
         #                                     = exp(x_i - m_i) / exp(log(l_i)) 
         #                                     = exp(x_i - m_i - log(l_i))
     
-    # finally dividing by the denominator of our softmax (this was done out-of-order from traditional softmax implementations)
-    O_block = O_block / l_i.expand_dims(1) 
-        # we can do this out-of-order since matmul (the tl.dot in _attn_fwd_inner) and entry-wise division are associative TODO
+    # finally dividing by the denominator of our softmax.
+    # notice we've already multiplied by V to get O, so this was done out-of-order from naive softmax implementations
+    O_block = O_block / l_i.expand_dims(1) # shapes (BLOCK_SIZE_Q, HEAD_DIM) / (BLOCK_SIZE_Q) = (BLOCK_SIZE_Q, HEAD_DIM)
+        # we can do this out-of-order since the matmul (the tl.dot in _attn_fwd_inner) and this entry-wise division 
+        #  are associative. matmul and entry-wise-ops are not normally, but at this level of granularity  it's no longer
+        #  actually a matmul but instead individual dot-products. for an example see # TODO put file path here
 
     # storing it all back to DRAM
     m_block_ptrs = M_ptr + index_batch_head * SEQ_LEN + offsets_q
     tl.store(m_block_ptrs, m_i)
-    tl.store(O_block_ptr, O_block.to(O_ptr.type.element_ty)) # TODO what's with this type changing stuff?
+    tl.store(O_block_ptrs, O_block.to(O_ptr.type.element_ty)) # TODO what's with this type changing stuff?
 
 
 @triton.jit
 def _attn_bwd_preprocess(
-    O,
-    dO,
-    D,
+    O_ptr,
+    dO_ptr,
+    D_ptr,
     SEQ_LEN,
     BLOCK_SIZE_Q: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -342,23 +344,23 @@ def _attn_bwd_preprocess(
     """
     # Load a single block of BLOCK_SIZE_Q rows of O
     O_block = tl.load(
-        O
+        O_ptr
         + index_batch_head * HEAD_DIM * SEQ_LEN
         + offsets_q.expand_dims(1) * HEAD_DIM
         + offsets_dim.expand_dims(0)
     )
     # Load a single block of BLOCK_SIZE_Q rows of dO
-    dO_block = tl.load( # TODO wouldn't we normally need to incorporate strides here?
-        dO
+    dO_block = tl.load( # TODO wouldn't we normally need to incorporate strides here? or do HEAD_DIM and SEQ_LEN count as strides since dO is asserted to be contiguous?
+        dO_ptr
         + index_batch_head * HEAD_DIM * SEQ_LEN
         + offsets_q.expand_dims(1) * HEAD_DIM
         + offsets_dim.expand_dims(0)
     ).to(tl.float32) # TODO why does this one get sent to float32 but not O_block? store tensors in 16 but grads in 32?
-    # Compute the D block
-    D_block = tl.sum(dO_block * O_block, axis=1)  # Shape: (BLOCK_SIZE_Q,) so we're summing along HEAD_DIM
-    # Store the D block
-    D_block_block_ptrs = D + index_batch_head * SEQ_LEN + offsets_q
-    tl.store(D_block_block_ptrs, D_block) # TODO figure out & explain why D is useful
+    # Compute and store the D block
+    D_block = tl.sum(dO_block * O_block, axis=1)  
+        # shape: sum((BLOCK_SIZE_Q, HEAD_DIM) * (BLOCK_SIZE_Q, HEAD_DIM), axis=1) = sum((BLOCK_SIZE_Q, HEAD_DIM), axis=1) = (BLOCK_SIZE_Q)
+    D_block_block_ptrs = D_ptr + index_batch_head * SEQ_LEN + offsets_q
+    tl.store(D_block_block_ptrs, D_block) # TODO figure out & explain why D is useful & why it's called D
 
 
 @triton.jit
@@ -691,26 +693,27 @@ class TritonAttention(torch.autograd.Function):
             # TODO switch this to auto-tune?
 
         # so as usual we combine batch_size & num_heads along the same parallelization axis.
-        # and here our preprocessing will also within the sequence length
+        # and here our preprocessing will also parallelize within the sequence length
         preprocess_grid = (SEQ_LEN // BLOCK_SIZE_MACRO, BATCH_SIZE * NUM_HEADS)
         D = torch.empty_like(M)  # Shape: (BATCH_SIZE, NUM_HEADS, SEQ_LEN)
             # TODO why do we call it D? what's its purpose?
 
         # Compute all the elements Di
         _attn_bwd_preprocess[preprocess_grid](
-            O=O,
-            dO=dO,
-            D=D,
+            O_ptr=O, dO_ptr=dO, D_ptr=D,
             SEQ_LEN=SEQ_LEN,
             BLOCK_SIZE_Q=BLOCK_SIZE_MACRO,
             HEAD_DIM=ctx.HEAD_DIM, # TODO why do we use the one from ctx instead of grabbing it above?
         )
 
+        # our next kernel calculated dK and dV and uses a parallelization scheme similar to the previous, but 3D
         grid = (SEQ_LEN // BLOCK_SIZE_MACRO, 1, BATCH_SIZE * NUM_HEADS)
+            # TODO why 3D and the 1? Isn't that the same number of PIDs but now you have to call the batch_heads ones with axis=2 instead of axis=1?
 
-        stage = 3 if ctx.causal else 1
+        stage = 3 if ctx.causal else 1 # TODO switch this to causal bool
 
         # Fix KV and iterate through all the Q blocks
+            # TODO what do we mean by "fix"?
         _attn_bwd_dk_dv[grid](
             Q=Q,
             K=K,
