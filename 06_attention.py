@@ -305,13 +305,6 @@ def _attn_fwd(
             SEQ_LEN,
         )
     
-    # This is needed to compute the logsumexp for the backwards pass. basically instead of saving the maxes 
-    #  and the sums separately, we save them together with the += log() and then a trick we'll see later.
-    m_i += tl.math.log(l_i)  # l_i was composed using the sum & exp operations in _attn_fwd_inner()
-        # this will work because softmax(x_i) = exp(x_i - m_i) / l_i 
-        #                                     = exp(x_i - m_i) / exp(log(l_i)) 
-        #                                     = exp(x_i - m_i - log(l_i))
-    
     # finally dividing by the denominator of our softmax.
     # notice we've already multiplied by V to get O, so this was done out-of-order from naive softmax implementations
     O_block = O_block / l_i.expand_dims(1) # shapes (BLOCK_SIZE_Q, HEAD_DIM) / (BLOCK_SIZE_Q) = (BLOCK_SIZE_Q, HEAD_DIM)
@@ -319,6 +312,17 @@ def _attn_fwd(
         #  are associative. matmul and entry-wise-ops are not normally, but at this level of granularity  it's no longer
         #  actually a matmul but instead individual dot-products. for an example see # TODO put file path here
 
+    # This is needed to compute the logsumexp (LSE) for the backwards pass. basically instead of saving the maxes 
+    #  and the sums separately, we save them together which still works thanks to exponential arithmetic
+    m_i += tl.math.log(l_i)  # l_i was composed using the sum & exp operations in _attn_fwd_inner()
+        # this will work because softmax(x_i) = exp(x_i - m_i) / l_i 
+        #                                     = exp(x_i - m_i) / exp(log(l_i)) 
+        #                                     = exp(x_i - m_i - log(l_i))
+        # personally I'd prefer to do change the name and do LSE_i = m_i + tl.math.log(l_i) since
+        #  that'd be more clear about what we're doing. However, it's inefficient since it'd require
+        #  that we allocate an entire new tensor for LSE. Instead we opt to re-use tensor m to store
+        #  our logsumexp. it's ugly but it gets the job done # TODO is this correct?
+    
     # storing it all back to DRAM
     m_block_ptrs = M_ptr + index_batch_head * SEQ_LEN + offsets_q
     tl.store(m_block_ptrs, m_i)
@@ -594,7 +598,7 @@ class TritonAttention(torch.autograd.Function):
             triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]), # primary parallelizatoin is across seq_len
             BATCH_SIZE * NUM_HEADS, # parallelize across the dimensions that don't matter
             1, # include the 1 for clarity of total dims even though it's not strictly necessary
-        )
+        ) # TODO remove the 1?
         
         # calling the forward kernel
         _attn_fwd[grid](
@@ -664,7 +668,7 @@ class TritonAttention(torch.autograd.Function):
         NUM_WARPS, NUM_STAGES = 4, 3 
         # here micro and macro block sizes will trade positions over the final two kernels, one # TODO finish explaining
         BLOCK_SIZE_MICRO, BLOCK_SIZE_MACRO = 32, 128
-            # TODO switch this to auto-tune
+            # TODO switch this to autotune. num_warps in [4,8] and block sizes both in [32, 64, 128]
 
         # so as usual we combine batch_size & num_heads along the same parallelization axis
         # and here our preprocessing will also parallelize within the sequence length
@@ -672,7 +676,7 @@ class TritonAttention(torch.autograd.Function):
         D = torch.empty_like(M)  # Shape: (BATCH_SIZE, NUM_HEADS, SEQ_LEN)
             # TODO why do we call it D? what's its purpose?
 
-        # Compute all the elements Di
+        # Compute D which is shape (BATCH_SIZE, NUM_HEADS, SEQ_LEN)
         _attn_backward_preprocess[preprocess_grid](
             O_ptr=O, dO_ptr=dO, D_ptr=D,
             SEQ_LEN=SEQ_LEN,
@@ -773,15 +777,8 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
     assert torch.allclose(ref_dQ, tri_dQ, atol=atol, rtol=rtol)
 
 
-test_op(BATCH_SIZE=4, NUM_HEADS=8, SEQ_LEN=1024, HEAD_DIM=64, causal=True)
-test_op(BATCH_SIZE=4, NUM_HEADS=8, SEQ_LEN=1024, HEAD_DIM=64, causal=False)
-print("PASSED")
 
-
-
-attention = TritonAttention.apply
-
-BATCH, N_HEADS, HEAD_DIM = 2, 8, 64
+BATCH, N_HEADS, HEAD_DIM = 32, 32, 64
 # vary seq length for fixed head and batch=4
 configs = []
 for mode in ["fwd", "bwd"]:
@@ -791,7 +788,7 @@ for mode in ["fwd", "bwd"]:
         configs.append(
             triton.testing.Benchmark(
                 x_names=["SEQ_LEN"],
-                x_vals=[2**i for i in range(8, 13)],
+                x_vals=[2**i for i in range(8, 14)], # LOWER 14 IF YOU DON't HAVE ENOUGH RAM
                 line_arg="provider",
                 line_vals=["triton", "torch"],
                 line_names=["Triton", "Torch"],
@@ -807,7 +804,6 @@ for mode in ["fwd", "bwd"]:
                 },
             ))
 
-
 @triton.testing.perf_report(configs)
 def bench_flash_attention(BATCH, H, SEQ_LEN, HEAD_DIM, causal, mode, provider, device=DEVICE):
     assert mode in ["fwd", "bwd"]
@@ -817,7 +813,7 @@ def bench_flash_attention(BATCH, H, SEQ_LEN, HEAD_DIM, causal, mode, provider, d
     v = torch.randn((BATCH, H, SEQ_LEN, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     sm_scale = 1.3
     if provider == 'triton':
-        fn = lambda: attention(q, k, v, causal, sm_scale)
+        fn = lambda: TritonAttention.apply(q, k, v, causal, sm_scale)
     if provider == 'torch':
         fn = lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal)
     if mode == "bwd":
@@ -833,5 +829,13 @@ def bench_flash_attention(BATCH, H, SEQ_LEN, HEAD_DIM, causal, mode, provider, d
         total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
     return total_flops * 1e-12 / (ms * 1e-3)
 
+if __name__ == "__main__":
+    # always run unit-tests
+    test_op(BATCH_SIZE=4, NUM_HEADS=8, SEQ_LEN=1024, HEAD_DIM=64, causal=True)
+    test_op(BATCH_SIZE=4, NUM_HEADS=8, SEQ_LEN=1024, HEAD_DIM=64, causal=False)
+    print("PASSED")
 
-bench_flash_attention.run(save_path='./benchmark_results/', print_data=True)
+    # Only run benchmark if explicitly requested
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--benchmark":
+        bench_flash_attention.run(save_path='./benchmark_results/', print_data=True)
