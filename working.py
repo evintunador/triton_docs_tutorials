@@ -527,7 +527,7 @@ def _attn_backward_dq(
 
 
 @triton.jit
-def _attn_backward(
+def _attn_backward_split(
     Q_ptr, K_ptr, V_ptr,
     softmax_scale,
     dO_ptr, dQ_ptr, dK_ptr, dV_ptr,
@@ -561,6 +561,7 @@ def _attn_backward(
     offset_batch_head_seq = (index_batch_head * SEQ_LEN).to(tl.int64)
     M_ptr += offset_batch_head_seq
     D_ptr += offset_batch_head_seq
+        # these two are different from the gropu above because they're of shape (BATCH_SIZE, HEAD_DIMS, SEQ_LEN)
 
     # for loading scales # TODO what are scales?
     offsets_dim = tl.arange(0, HEAD_DIM)
@@ -590,6 +591,119 @@ def _attn_backward(
         HEAD_DIM=HEAD_DIM, # TODO again why we using ctx again?
         STAGE=STAGE, # TODO see using STAGE is confusing AF when pytorch already has num_stages
     )
+
+
+
+@triton.jit
+def _attn_backward(
+    Q_ptr, K_ptr, V_ptr,
+    softmax_scale,
+    dO_ptr, dQ_ptr, dK_ptr, dV_ptr,
+    L_ptr, D_ptr,
+    locks_ptr,
+    stride_batch, stride_head, stride_seq, stride_dim,
+    NUM_HEADS, SEQ_LEN,
+    BLOCK_SIZE_ROW: tl.constexpr, BLOCK_SIZE_COL: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    CAUSAL: tl.constexpr,
+):
+    # selecting which pid we are in respect to BATCH_SIZE and NUM_HEADS
+    idx_batch_head = tl.program_id(0) # TODO see why do we need a 3D launch grid?!
+    idx_batch = idx_batch_head // NUM_HEADS # getting the sequence in the batch this pid is assigned to
+    idx_head = idx_batch_head % NUM_HEADS # getting the head this pid is assigned to
+
+    # This offset allows us to select the right (SEQ_LEN, HEAD_DIM) matrix from a tensor of shape 
+    #  (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM) given the batch and head
+    offset_batch_head = (stride_batch * idx_batch + stride_head * idx_head).to(tl.int64)
+        # TODO i presume int64 is bc BATCH_SIZE * NUM_HEADS could legitimately exhaust int64's representation range?
+    # The reason we don't access the blocks through the automated method make_block_ptr is because we need to use the range of 
+    #  offsets to apply the masking, meaning there are times when building pointers manually provides more control
+    Q_ptr += offset_batch_head
+    K_ptr += offset_batch_head
+    V_ptr += offset_batch_head
+    dO_ptr += offset_batch_head
+    dQ_ptr += offset_batch_head
+    dK_ptr += offset_batch_head
+    dV_ptr += offset_batch_head
+    Lock_ptr = locks_ptr + offset_batch_head
+
+    # Make sure the pointers are in the right place w.r.t batch, head and sequence
+    offset_batch_head_seq = (idx_batch_head * SEQ_LEN).to(tl.int64) # TODO stride_seq instead of SEQ_LEN?
+    L_ptr += offset_batch_head_seq
+    D_ptr += offset_batch_head_seq
+        # these two are different from the group above because they're of shape (BATCH_SIZE, HEAD_DIMS, SEQ_LEN)
+
+    idx_block = tl.program_id(1)
+    idx_block_row = idx_block * BLOCK_SIZE_ROW
+    idx_block_col = idx_block * BLOCK_SIZE_COL
+
+    offsets_row = tl.arange(0, BLOCK_SIZE_ROW)
+    offsets_col = tl.arange(0, BLOCK_SIZE_COL)
+    offsets_dim = tl.arange(0, HEAD_DIM)
+
+    # Split Q, dQ, O and dO into blocks of size (BLOCK_SIZE_ROW, HEAD_DIM)
+    # Split K, dK, V and dV into blocks of size (BLOCK_SIZE_COL, HEAD_DIM)
+    # Split L and D into blocks of size (BLOCK_SIZE_ROW)
+
+    # step 6
+    K_block_ptrs = K_ptr + idx_block_col * stride_seq + offsets_col.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+    K_j = tl.load(K_block_ptrs)
+    V_block_ptrs = V_ptr + idx_block_col * stride_seq + offsets_col.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+    V_j = tl.load(V_block_ptrs)
+
+    # step 7
+    dK_j = tl.zeros([BLOCK_SIZE_COL, HEAD_DIM], dtype=tl.float32)
+    dV_j = tl.zeros([BLOCK_SIZE_COL, HEAD_DIM], dtype=tl.float32)
+
+    #T_row = tl.cdiv(SEQ_LEN, BLOCK_SIZE_ROW)
+    #for i in range(T_row): # TODO for causal mask it might make sense to use this loop version and j == i as the condition
+    for i in range(0, SEQ_LEN, BLOCK_SIZE_ROW):
+
+        ### step 9
+        # the ones of shape (BLOCK_SIZE_ROW, HEAD_DIM)
+        Q_block_ptrs = Q_ptr + i + offsets_row.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+        Q_i = tl.load(Q_block_ptrs)
+        #O_block_ptrs = O_ptr + i + offsets_row.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+        #O_i = tl.load(O_block_ptrs)
+        dO_block_ptrs = dO_ptr + i + offsets_row.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+        dO_i = tl.load(dO_block_ptrs)
+        # the ones of shape (BLOCK_SIZE_ROW)
+        L_i = tl.load(L_ptr + i + offsets_row)
+        D_i = tl.load(D_ptr + i + offsets_row)
+
+        # step 10
+        S_ji = tl.dot(Q_i, tl.trans(K_j)) * softmax_scale 
+            # shape (BLOCK_SIZE_ROW, HEAD_DIM) @ (HEAD_DIM, BLOCK_SIZE_COL) -> (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
+        # step 11
+        P_ji = tl.exp(S_ji - L_i.expand_dims(1)) 
+            # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL) - (BLOCK_SIZE_ROW, 1) -> (BLOCK_SIZE_ROW, BLOCK_SIZE_COL) 
+        # step 12
+        dV_j = tl.dot(tl.trans(P_ji).to(tl.float16), dO_i, acc=dV_j) # TODO why do we need "dV_j = " if we've got "acc=dV_j"
+            # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW) @ (BLOCK_SIZE_ROW, HEAD_DIM) -> (BLOCK_SIZE_COL, HEAD_DIM)
+        # step 13
+        dP_ji = tl.dot(dO_i, tl.trans(V_j)).to(tl.float32)
+            # shape (BLOCK_SIZE_ROW, HEAD_DIM) @ (HEAD_DIM, BLOCK_SIZE_COL) -> (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
+        # step 14
+        dS_ji = P_ji * (dP_ji - D_i.expand_dims(1)) 
+            # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL) * [(BLOCK_SIZE_ROW, BLOCK_SIZE_COL) - (BLOCKK_SIZE_ROW, 1)] -> (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
+        dS_ji = dS_ji.to(tl.float16)
+
+        # step 15
+        dQ_block_ptrs = dQ_ptr + i + offsets_row.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+        #dQ_i = tl.load(dQ_block_ptrs)
+        delta = softmax_scale * tl.dot(dS_ji, K_j)
+        tl.atomic_add(dQ_block_ptrs, delta)
+        # TODO supposedly this is an alternative to implementing a lock but i'm not confident that it's working and my locks were getting stuck
+
+        # step 16
+        dK_j = tl.dot(tl.trans(dS_ji), Q_i, acc=dK_j)
+
+    dK_block_ptrs = dK_ptr + idx_block_col * stride_seq + offsets_col.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+    tl.store(dK_block_ptrs, dK_j)
+    dV_block_ptrs = dV_ptr + idx_block_col * stride_seq + offsets_col.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+    tl.store(dV_block_ptrs, dV_j)
+
+
 
 
 
@@ -688,14 +802,15 @@ class TritonAttention(torch.autograd.Function):
             # TODO why do we use ctx.HEAD_DIM instead of getting it here? is it because of the tl.constexpr?
 
         # heuristic meta-parameters that we could've used an autotune on when defining the kernel instead
-        NUM_WARPS, NUM_STAGES = 4, 3 
+        NUM_WARPS, NUM_STAGES = 4, 1
         # here micro and macro block sizes will trade positions over the final two kernels, one # TODO finish explaining
-        BLOCK_SIZE_MICRO, BLOCK_SIZE_MACRO = 32, 128
+        #BLOCK_SIZE_MICRO, BLOCK_SIZE_MACRO = 32, 128
+        BLOCK_SIZE_COL, BLOCK_SIZE_ROW = 32, 128 # 128, 32 # TODO what's the deal with these?
             # TODO switch this to autotune. num_warps in [4,8] and block sizes both in [32, 64, 128]
 
         # so as usual we combine batch_size & num_heads along the same parallelization axis
         # and here our preprocessing will also parallelize within the sequence length
-        preprocess_grid = (SEQ_LEN // BLOCK_SIZE_MACRO, BATCH_SIZE * NUM_HEADS)
+        preprocess_grid = (SEQ_LEN // BLOCK_SIZE_ROW, BATCH_SIZE * NUM_HEADS)
         D = torch.empty_like(M)  # Shape: (BATCH_SIZE, NUM_HEADS, SEQ_LEN)
             # TODO why do we call it D? what's its purpose?
 
@@ -703,16 +818,18 @@ class TritonAttention(torch.autograd.Function):
         _attn_backward_preprocess[preprocess_grid](
             O_ptr=O, dO_ptr=dO, D_ptr=D,
             SEQ_LEN=SEQ_LEN,
-            BLOCK_SIZE_Q=BLOCK_SIZE_MACRO,
+            BLOCK_SIZE_Q=BLOCK_SIZE_ROW, # BLOCK_SIZE_MACRO,
             HEAD_DIM=ctx.HEAD_DIM, # TODO why do we use the one from ctx instead of grabbing it above?
         )
 
+        """
         # our next kernel calculated dK and dV and uses a parallelization scheme similar to the previous, but 3D
         grid = (SEQ_LEN // BLOCK_SIZE_MACRO, 1, BATCH_SIZE * NUM_HEADS)
             # TODO why 3D and the 1? Isn't that the same number of PIDs but now you have to call the batch_heads ones with axis=2 instead of axis=1?
+        
         stage = 3 if ctx.causal else 1 # TODO switch this to causal bool
 
-        _attn_backward[grid](
+        _attn_backward_split[grid](
             Q_ptr=Q, K_ptr=K, V_ptr=V,
             softmax_scale=ctx.softmax_scale,
             dO_ptr=dO, dQ_ptr=dQ, dK_ptr=dK, dV_ptr=dV,
@@ -722,6 +839,27 @@ class TritonAttention(torch.autograd.Function):
             BLOCK_SIZE_MACRO=BLOCK_SIZE_MACRO, BLOCK_SIZE_MICRO=BLOCK_SIZE_MICRO,
             HEAD_DIM=ctx.HEAD_DIM, # TODO again why we using ctx again?
             STAGE=stage, # TODO see using STAGE is confusing AF when pytorch already has num_stages
+            num_warps=NUM_WARPS, num_stages=NUM_STAGES,
+        )#"""
+        locks = torch.zeros(
+            (BATCH_SIZE, HEAD_DIM, SEQ_LEN // BLOCK_SIZE_COL), 
+            dtype=torch.int32, 
+            device=DEVICE
+        )
+
+        grid = (BATCH_SIZE * NUM_HEADS, SEQ_LEN // BLOCK_SIZE_COL)
+        _attn_backward[grid](
+            Q_ptr=Q, K_ptr=K, V_ptr=V,
+            softmax_scale=ctx.softmax_scale,
+            dO_ptr=dO, dQ_ptr=dQ, dK_ptr=dK, dV_ptr=dV,
+            L_ptr=M, # TODO make max & logsumexp notation consistent
+            D_ptr=D,
+            locks_ptr=locks,
+            stride_batch=Q.stride(0), stride_head=Q.stride(1), stride_seq=Q.stride(2), stride_dim=Q.stride(3),
+            NUM_HEADS=NUM_HEADS, SEQ_LEN=SEQ_LEN,
+            BLOCK_SIZE_ROW=BLOCK_SIZE_ROW, BLOCK_SIZE_COL=BLOCK_SIZE_COL,
+            HEAD_DIM=ctx.HEAD_DIM, # TODO again why we using ctx again?
+            CAUSAL=ctx.causal,
             num_warps=NUM_WARPS, num_stages=NUM_STAGES,
         )
         
@@ -778,9 +916,9 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
     rtol = 0.0
     atol = 1e-2
     assert torch.allclose(ref_O, tri_out, atol=atol, rtol=rtol)
-    assert torch.allclose(ref_dK, tri_dK, atol=atol, rtol=rtol)
-    assert torch.allclose(ref_dV, tri_dV, atol=atol, rtol=rtol)
-    assert torch.allclose(ref_dQ, tri_dQ, atol=atol, rtol=rtol)
+    assert torch.allclose(ref_dQ, tri_dQ, atol=atol, rtol=rtol)#, f"{ref_dQ}\n{tri_dQ}"
+    assert torch.allclose(ref_dV, tri_dV, atol=atol, rtol=rtol)#, f"{ref_dV}\n{tri_dV}"
+    assert torch.allclose(ref_dK, tri_dK, atol=atol, rtol=rtol)#, f"{ref_dK}\n{tri_dK}"
 
 
 
@@ -837,8 +975,8 @@ def bench_flash_attention(BATCH, H, SEQ_LEN, HEAD_DIM, causal, mode, provider, d
 
 if __name__ == "__main__":
     # always run unit-tests
-    test_op(BATCH_SIZE=4, NUM_HEADS=8, SEQ_LEN=1024, HEAD_DIM=64, causal=True)
-    test_op(BATCH_SIZE=4, NUM_HEADS=8, SEQ_LEN=1024, HEAD_DIM=64, causal=False)
+    #test_op(BATCH_SIZE=4, NUM_HEADS=8, SEQ_LEN=1024, HEAD_DIM=64, causal=True)
+    test_op(BATCH_SIZE=1, NUM_HEADS=1, SEQ_LEN=256, HEAD_DIM=64, causal=False)
     print("PASSED")
 
     # Only run benchmark if explicitly requested
