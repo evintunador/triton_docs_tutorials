@@ -339,15 +339,16 @@ def _attn_backward_preprocess(
     HEAD_DIM: tl.constexpr,
 ):
     """the job of this kernel is to pre-compute D since D is used by both of the following two kernels"""
-    block_index_q = tl.program_id(0)
+    block_index_q = tl.program_id(0) # SEQ_LEN / BLOCK_SIZE_Q number of pids
     offsets_q = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
-    index_batch_head = tl.program_id(1)
+    index_batch_head = tl.program_id(1) # BATCH_SIZE * NUM_HEADS number of pids
     offsets_dim = tl.arange(0, HEAD_DIM)
 
     # Load BLOCK_SIZE_Q rows of O
-    O_ptr += index_batch_head * HEAD_DIM * SEQ_LEN # move O_ptr to the correct batch & head for this pid. HEAD_
+    O_ptr += index_batch_head * HEAD_DIM * SEQ_LEN # moves O_ptr to the correct batch & head for this pid.
         # HEAD_DIM * SEQ_LEN is equal to stride_num_heads. we can use them instead of .stride() since we know dO is contiguous
     O_block_ptrs = O_ptr + offsets_q.expand_dims(1) * HEAD_DIM + offsets_dim.expand_dims(0) # TODO what does multiplying by HEAD_DIM do??
+        # so does *HEAD_DIM actually mean our block actually has gaps in-between each row?
     O_block = tl.load(O_block_ptrs) # shape (BLOCK_SIZE_Q, HEAD_DIM)
 
     # Load BLOCK_SIZE_Q rows of dO
@@ -359,6 +360,7 @@ def _attn_backward_preprocess(
     # so D is the dot product of O and dO along HEAD_DIM, giving us a single scalar Di per token in SEQ_LEN
     D_block = tl.sum(dO_block * O_block, axis=1)  
         # shape: sum((BLOCK_SIZE_Q, HEAD_DIM) * (BLOCK_SIZE_Q, HEAD_DIM), axis=1) -> sum((BLOCK_SIZE_Q, HEAD_DIM), axis=1) -> (BLOCK_SIZE_Q)
+        # TODO the OG paper says this is actually of size (HEAD_DIM) meaning either it has a typo or i'm misinterpreting what axis=1 means
     D_block_ptrs = D_ptr + index_batch_head * SEQ_LEN + offsets_q
     tl.store(D_block_ptrs, D_block) # TODO figure out & explain why D is useful & why it's called D
 
@@ -778,17 +780,15 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
 
 
 
-BATCH, N_HEADS, HEAD_DIM = 32, 32, 64
+BATCH, N_HEADS, HEAD_DIM = 32, 32, 64 # LOWER THESE IF YOU DON'T HAVE ENOUGH RAM
 # vary seq length for fixed head and batch=4
 configs = []
 for mode in ["fwd", "bwd"]:
     for causal in [True, False]:
-        #if mode == "bwd" and not causal:
-            #continue
         configs.append(
             triton.testing.Benchmark(
                 x_names=["SEQ_LEN"],
-                x_vals=[2**i for i in range(8, 14)], # LOWER 14 IF YOU DON't HAVE ENOUGH RAM
+                x_vals=[2**i for i in range(8, 14)], # LOWER 14 IF YOU DON'T HAVE ENOUGH RAM
                 line_arg="provider",
                 line_vals=["triton", "torch"],
                 line_names=["Triton", "Torch"],
@@ -828,6 +828,8 @@ def bench_flash_attention(BATCH, H, SEQ_LEN, HEAD_DIM, causal, mode, provider, d
     if mode == "bwd":
         total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
     return total_flops * 1e-12 / (ms * 1e-3)
+
+
 
 if __name__ == "__main__":
     # always run unit-tests
