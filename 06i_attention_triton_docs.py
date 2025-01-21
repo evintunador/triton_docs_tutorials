@@ -551,24 +551,23 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, dtype=torch.float16):
 
 
 
-TORCH_HAS_FP8 = hasattr(torch, 'float8_e5m2')
-BATCH, N_HEADS, HEAD_DIM = 4, 32, 64
+BATCH, N_HEADS, HEAD_DIM = 2, 8, 64
 # vary seq length for fixed head and batch=4
 configs = []
 for mode in ["fwd", "bwd"]:
     for causal in [True, False]:
-        if mode == "bwd" and not causal:
-            continue
+        #if mode == "bwd" and not causal:
+            #continue
         configs.append(
             triton.testing.Benchmark(
                 x_names=["N_CTX"],
-                x_vals=[2**i for i in range(10, 15)],
+                x_vals=[2**i for i in range(8, 13)],
                 line_arg="provider",
-                line_vals=["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []),
-                line_names=["Triton [FP16]"] + (["Triton [FP8]"] if TORCH_HAS_FP8 else []),
+                line_vals=["triton", 'torch'],
+                line_names=["Triton", 'torch'],
                 styles=[("red", "-"), ("blue", "-")],
                 ylabel="TFLOPS",
-                plot_name=f"fused-attention-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}-{mode}-causal={causal}",
+                plot_name=f"fused_attention-official_docs-{mode}-causal={causal}",
                 args={
                     "H": N_HEADS,
                     "BATCH": BATCH,
@@ -586,14 +585,11 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, mode, provider, dev
     q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-    if mode == "fwd" and "fp8" in provider:
-        q = q.to(torch.float8_e5m2)
-        k = k.to(torch.float8_e5m2)
-        v = v.permute(0, 1, 3, 2).contiguous()
-        v = v.permute(0, 1, 3, 2)
-        v = v.to(torch.float8_e5m2)
     sm_scale = 1.3
-    fn = lambda: attention(q, k, v, causal, sm_scale)
+    if provider == 'triton':
+        fn = lambda: attention(q, k, v, causal, sm_scale)
+    if provider == 'torch':
+        fn = lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal)
     if mode == "bwd":
         o = fn()
         do = torch.randn_like(o)

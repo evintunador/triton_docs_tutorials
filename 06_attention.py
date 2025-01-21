@@ -10,6 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
+DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
 @triton.jit
 def _attn_fwd_inner(
@@ -333,34 +334,29 @@ def _attn_backward_preprocess(
     BLOCK_SIZE_Q: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
+    """the job of this kernel is to pre-compute D since D is used by both of the following two kernels"""
     block_index_q = tl.program_id(0)
     offsets_q = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
     index_batch_head = tl.program_id(1)
     offsets_dim = tl.arange(0, HEAD_DIM)
 
-    """
-    TODO wouldn't we normally need to incorporate strides here?
-    i suppose HEAD_DIM and SEQ_LEN are acting like strides since we know that dO is contiguous? is that why?
-    """
-    # Load a single block of BLOCK_SIZE_Q rows of O
-    O_block = tl.load(
-        O_ptr
-        + index_batch_head * HEAD_DIM * SEQ_LEN
-        + offsets_q.expand_dims(1) * HEAD_DIM
-        + offsets_dim.expand_dims(0)
-    )
-    # Load a single block of BLOCK_SIZE_Q rows of dO
-    dO_block = tl.load( # TODO wouldn't we normally need to incorporate strides here? or do HEAD_DIM and SEQ_LEN count as strides since dO is asserted to be contiguous?
-        dO_ptr
-        + index_batch_head * HEAD_DIM * SEQ_LEN
-        + offsets_q.expand_dims(1) * HEAD_DIM
-        + offsets_dim.expand_dims(0)
-    ).to(tl.float32) # TODO why does this one get sent to float32 but not O_block? store tensors in 16 but grads in 32?
-    # Compute and store the D block
+    # Load BLOCK_SIZE_Q rows of O
+    O_ptr += index_batch_head * HEAD_DIM * SEQ_LEN # move O_ptr to the correct batch & head for this pid. HEAD_
+        # HEAD_DIM * SEQ_LEN is equal to stride_num_heads. we can use them instead of .stride() since we know dO is contiguous
+    O_block_ptrs = O_ptr + offsets_q.expand_dims(1) * HEAD_DIM + offsets_dim.expand_dims(0) # TODO what does multiplying by HEAD_DIM do??
+    O_block = tl.load(O_block_ptrs) # shape (BLOCK_SIZE_Q, HEAD_DIM)
+
+    # Load BLOCK_SIZE_Q rows of dO
+    dO_ptr += index_batch_head * HEAD_DIM * SEQ_LEN
+    dO_block_ptrs = dO_ptr + offsets_q.expand_dims(1) * HEAD_DIM + offsets_dim.expand_dims(0) # TODO what does multiplying by HEAD_DIM do??
+    dO_block = tl.load(dO_block_ptrs).to(tl.float32) # shape (BLOCK_SIZE_Q, HEAD_DIM) 
+        # TODO why does this one get sent to float32 but not O_block? store tensors in 16 but grads in 32?
+
+    # so D is the dot product of O and dO along HEAD_DIM, giving us a single scalar Di per token in SEQ_LEN
     D_block = tl.sum(dO_block * O_block, axis=1)  
-        # shape: sum((BLOCK_SIZE_Q, HEAD_DIM) * (BLOCK_SIZE_Q, HEAD_DIM), axis=1) = sum((BLOCK_SIZE_Q, HEAD_DIM), axis=1) = (BLOCK_SIZE_Q)
-    D_block_block_ptrs = D_ptr + index_batch_head * SEQ_LEN + offsets_q
-    tl.store(D_block_block_ptrs, D_block) # TODO figure out & explain why D is useful & why it's called D
+        # shape: sum((BLOCK_SIZE_Q, HEAD_DIM) * (BLOCK_SIZE_Q, HEAD_DIM), axis=1) -> sum((BLOCK_SIZE_Q, HEAD_DIM), axis=1) -> (BLOCK_SIZE_Q)
+    D_block_ptrs = D_ptr + index_batch_head * SEQ_LEN + offsets_q
+    tl.store(D_block_ptrs, D_block) # TODO figure out & explain why D is useful & why it's called D
 
 
 @triton.jit
@@ -503,14 +499,8 @@ def _attn_backward_dq(
     index_batch_head = tl.program_id(2)
     index_batch = index_batch_head // NUM_HEADS
     index_head = index_batch_head % NUM_HEADS
-    offset_batch_head = (stride_batch * index_batch + stride_head * index_head).to(
-        tl.int64
-    )
-    # This is the offset that allows us to select the right sequence given the batch and head.
-    offset_batch_head_seq = (index_batch_head * SEQ_LEN).to(tl.int64)
-
+    offset_batch_head = (stride_batch * index_batch + stride_head * index_head).to(tl.int64)
     # Make sure the pointers are in the right place w.r.t batch and head
-    # The reason we don't access the blocks through make_block_ptr is because we need to use the range of offsets to apply the masking
     Q_ptr += offset_batch_head
     K_ptr += offset_batch_head
     V_ptr += offset_batch_head
@@ -520,6 +510,7 @@ def _attn_backward_dq(
     dV_ptr += offset_batch_head
 
     # Make sure the pointers are in the right place w.r.t batch, head and sequence
+    offset_batch_head_seq = (index_batch_head * SEQ_LEN).to(tl.int64)
     M_ptr += offset_batch_head_seq
     D_ptr += offset_batch_head_seq
 
@@ -533,9 +524,7 @@ def _attn_backward_dq(
 
     Q_block = tl.load(Q_ptr + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim)
     dQ_block = tl.zeros([BLOCK_SIZE_Q, HEAD_DIM], dtype=tl.float32)
-    dO_block = tl.load(
-        dO_ptr + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
-    )
+    dO_block = tl.load(dO_ptr + offsets_q.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim)
 
     M_block = tl.load(M_ptr + offsets_q)
     M_block = M_block.expand_dims(1)
@@ -651,7 +640,7 @@ class TritonAttention(torch.autograd.Function):
         one of the optimizations flash-attention makes involves not saving all forward-pass information 
         in order to avoid storing it in DRAM, so now in the backward-pass we'll have to re-compute some of
         that information. Although this does involve redundant calculations and therefore hamper runtime,
-        it's worth it in terms of how much DRAM we're waving which will effectively allow us to use a larger
+        it's worth it in terms of how much DRAM we're saving which will effectively allow us to use a larger
         and therefore more capable model
         """
         # grabbing the saved forward pass info
@@ -660,6 +649,8 @@ class TritonAttention(torch.autograd.Function):
         # indexing is easier if all the entries in dO are lined up cleanly in DRAM as opposed to spotted around
         assert dO.is_contiguous() 
         assert Q.stride() == K.stride() == V.stride() == O.stride() == dO.stride()
+            # each stride tuple is (NUM_HEADS * SEQ_LEN * HEAD_DIM,     SEQ_LEN * HEAD_DIM,     HEAD_DIM,       1)
+            #                      (stride_batch,                       stride_heads,           stride_seq,     stride_dim)
 
         # pre-allocating our eventual output gradients
         dQ = torch.empty_like(Q)
@@ -671,10 +662,11 @@ class TritonAttention(torch.autograd.Function):
 
         # heuristic meta-parameters that we could've used an autotune on when defining the kernel instead
         NUM_WARPS, NUM_STAGES = 4, 3 
+        # here micro and macro block sizes will trade positions over the final two kernels, one # TODO finish explaining
         BLOCK_SIZE_MICRO, BLOCK_SIZE_MACRO = 32, 128
-            # TODO switch this to auto-tune?
+            # TODO switch this to auto-tune
 
-        # so as usual we combine batch_size & num_heads along the same parallelization axis.
+        # so as usual we combine batch_size & num_heads along the same parallelization axis
         # and here our preprocessing will also parallelize within the sequence length
         preprocess_grid = (SEQ_LEN // BLOCK_SIZE_MACRO, BATCH_SIZE * NUM_HEADS)
         D = torch.empty_like(M)  # Shape: (BATCH_SIZE, NUM_HEADS, SEQ_LEN)
@@ -781,7 +773,65 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
     assert torch.allclose(ref_dQ, tri_dQ, atol=atol, rtol=rtol)
 
 
-if __name__ == "__main__":
-    test_op(BATCH_SIZE=4, NUM_HEADS=8, SEQ_LEN=1024, HEAD_DIM=64, causal=True)
-    test_op(BATCH_SIZE=4, NUM_HEADS=8, SEQ_LEN=1024, HEAD_DIM=64, causal=False)
-    print("PASSED")
+test_op(BATCH_SIZE=4, NUM_HEADS=8, SEQ_LEN=1024, HEAD_DIM=64, causal=True)
+test_op(BATCH_SIZE=4, NUM_HEADS=8, SEQ_LEN=1024, HEAD_DIM=64, causal=False)
+print("PASSED")
+
+
+
+attention = TritonAttention.apply
+
+BATCH, N_HEADS, HEAD_DIM = 2, 8, 64
+# vary seq length for fixed head and batch=4
+configs = []
+for mode in ["fwd", "bwd"]:
+    for causal in [True, False]:
+        #if mode == "bwd" and not causal:
+            #continue
+        configs.append(
+            triton.testing.Benchmark(
+                x_names=["SEQ_LEN"],
+                x_vals=[2**i for i in range(8, 13)],
+                line_arg="provider",
+                line_vals=["triton", "torch"],
+                line_names=["Triton", "Torch"],
+                styles=[("red", "-"), ("blue", "-")],
+                ylabel="TFLOPS",
+                plot_name=f"fused_attention-{mode}-causal={causal}",
+                args={
+                    "H": N_HEADS,
+                    "BATCH": BATCH,
+                    "HEAD_DIM": HEAD_DIM,
+                    "mode": mode,
+                    "causal": causal,
+                },
+            ))
+
+
+@triton.testing.perf_report(configs)
+def bench_flash_attention(BATCH, H, SEQ_LEN, HEAD_DIM, causal, mode, provider, device=DEVICE):
+    assert mode in ["fwd", "bwd"]
+    dtype = torch.float16
+    q = torch.randn((BATCH, H, SEQ_LEN, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    k = torch.randn((BATCH, H, SEQ_LEN, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    v = torch.randn((BATCH, H, SEQ_LEN, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    sm_scale = 1.3
+    if provider == 'triton':
+        fn = lambda: attention(q, k, v, causal, sm_scale)
+    if provider == 'torch':
+        fn = lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal)
+    if mode == "bwd":
+        O = fn()
+        dO = torch.randn_like(O)
+        fn = lambda: O.backward(dO, retain_graph=True)
+    ms = triton.testing.do_bench(fn)
+    flops_per_matmul = 2.0 * BATCH * H * SEQ_LEN * SEQ_LEN * HEAD_DIM
+    total_flops = 2 * flops_per_matmul
+    if causal:
+        total_flops *= 0.5
+    if mode == "bwd":
+        total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
+    return total_flops * 1e-12 / (ms * 1e-3)
+
+
+bench_flash_attention.run(save_path='./benchmark_results/', print_data=True)
