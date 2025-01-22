@@ -636,7 +636,7 @@ def _attn_backward(
     D_ptr += offset_batch_head_seq
 
     # selecting which pid we are in respect to column splits of the (SEQ_LEN, SEQ_LEN) attention matrix
-    idx_block = tl.program_id(1)
+    idx_block = tl.program_id(1) # AKA our 'j' idx
     idx_block_col = idx_block * BLOCK_SIZE_COL
 
     offsets_row = tl.arange(0, BLOCK_SIZE_ROW)
@@ -648,59 +648,68 @@ def _attn_backward(
     # Split L and D into blocks of size (BLOCK_SIZE_ROW)
 
     # step 6
-    K_block_ptrs = K_ptr + idx_block_col * stride_seq + offsets_col.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
-    K_j = tl.load(K_block_ptrs)
-    V_block_ptrs = V_ptr + idx_block_col * stride_seq + offsets_col.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
-    V_j = tl.load(V_block_ptrs)
+    K_j = tl.load(K_ptr + idx_block_col * stride_seq \
+                    + offsets_col.expand_dims(1) * stride_seq \
+                    + offsets_dim.expand_dims(0) * stride_dim)
+    V_j = tl.load(V_ptr + idx_block_col * stride_seq \
+                    + offsets_col.expand_dims(1) * stride_seq \
+                    + offsets_dim.expand_dims(0) * stride_dim)
 
     # step 7
     dK_j = tl.zeros([BLOCK_SIZE_COL, HEAD_DIM], dtype=tl.float32)
     dV_j = tl.zeros([BLOCK_SIZE_COL, HEAD_DIM], dtype=tl.float32)
 
     #T_row = tl.cdiv(SEQ_LEN, BLOCK_SIZE_ROW)
-    #for i in range(T_row): # TODO for causal mask it might make sense to use this loop version and j == i as the condition
-    for i in range(0, SEQ_LEN, BLOCK_SIZE_ROW):
-        i = tl.multiple_of(i, BLOCK_SIZE_ROW)
+    #for start_row in range(T_row): # TODO for causal mask it might make sense to use this loop version and j == i as the condition
+    for start_row in range(0, SEQ_LEN, BLOCK_SIZE_ROW): # AKA our 'i' idx
+        start_row = tl.multiple_of(start_row, BLOCK_SIZE_ROW)
 
         ### step 9
         # the ones of shape (BLOCK_SIZE_ROW, HEAD_DIM)
-        Q_block_ptrs = Q_ptr + i + offsets_row.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
-        Q_i = tl.load(Q_block_ptrs)
-        dO_block_ptrs = dO_ptr + i + offsets_row.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
-        dO_i = tl.load(dO_block_ptrs)
+        Q_i = tl.load(Q_ptr + start_row * stride_seq \
+                        + offsets_row.expand_dims(1) * stride_seq \
+                        + offsets_dim.expand_dims(0) * stride_dim)
+        dO_i = tl.load(dO_ptr + start_row * stride_seq \
+                        + offsets_row.expand_dims(1) * stride_seq \
+                        + offsets_dim.expand_dims(0) * stride_dim)
         # the ones of shape (BLOCK_SIZE_ROW)
-        L_i = tl.load(L_ptr + i + offsets_row)
-        D_i = tl.load(D_ptr + i + offsets_row)
+        L_i = tl.load(L_ptr + start_row + offsets_row)
+        D_i = tl.load(D_ptr + start_row + offsets_row)
 
         # step 10
-        S_ji = tl.dot(Q_i, tl.trans(K_j)) * softmax_scale 
+        S_ij = tl.dot(Q_i, tl.trans(K_j)) * softmax_scale 
             # shape (BLOCK_SIZE_ROW, HEAD_DIM) @ (HEAD_DIM, BLOCK_SIZE_COL) -> (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
         # step 11
-        P_ji = tl.exp(S_ji - L_i.expand_dims(1)) 
+        P_ij = tl.exp(S_ij - L_i.expand_dims(1)) # TODO try exp2
             # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL) - (BLOCK_SIZE_ROW, 1) -> (BLOCK_SIZE_ROW, BLOCK_SIZE_COL) 
         # step 12
-        dV_j = tl.dot(tl.trans(P_ji).to(tl.float16), dO_i, acc=dV_j) # TODO why do we need "dV_j = " if we've got "acc=dV_j"
+        #dV_j = tl.dot(tl.trans(P_ij).to(tl.float16), dO_i, acc=dV_j) # TODO why do we need "dV_j = " if we've got "acc=dV_j"
+        dV_j += tl.dot(tl.trans(P_ij).to(tl.float16), dO_i)
             # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW) @ (BLOCK_SIZE_ROW, HEAD_DIM) -> (BLOCK_SIZE_COL, HEAD_DIM)
         # step 13
-        dP_ji = tl.dot(dO_i, tl.trans(V_j)).to(tl.float32)
+        dP_ij = tl.dot(dO_i, tl.trans(V_j)).to(tl.float32)
             # shape (BLOCK_SIZE_ROW, HEAD_DIM) @ (HEAD_DIM, BLOCK_SIZE_COL) -> (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
         # step 14
-        dS_ji = P_ji * (dP_ji - D_i.expand_dims(1)) 
+        dS_ij = P_ij * (dP_ij - D_i.expand_dims(1)) 
             # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL) * [(BLOCK_SIZE_ROW, BLOCK_SIZE_COL) - (BLOCKK_SIZE_ROW, 1)] -> (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
-        dS_ji = dS_ji.to(tl.float16)
+        dS_ij = dS_ij.to(tl.float16)
+            # TODO build some understanding on why which operations are which dtype
 
         # step 15
-        dQ_block_ptrs = dQ_ptr + i + offsets_row.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
-        dQ_i = tl.load(dQ_block_ptrs)
-        delta = softmax_scale * tl.dot(dS_ji, K_j)
-        tl.store(dQ_block_ptrs, dQ_i + delta)
+        dQ_block_ptrs = dQ_ptr + start_row * stride_seq + offsets_row.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+        delta = softmax_scale * tl.dot(dS_ij, K_j)
+        tl.atomic_add(dQ_block_ptrs, delta)
 
         # step 16
-        dK_j += tl.dot(tl.trans(dS_ji), Q_i)
+        dK_j += softmax_scale * tl.dot(tl.trans(dS_ij), Q_i)
 
-    dK_block_ptrs = dK_ptr + idx_block_col * stride_seq + offsets_col.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+    dK_block_ptrs = dK_ptr + idx_block_col * stride_seq \
+                    + offsets_col.expand_dims(1) * stride_seq \
+                    + offsets_dim.expand_dims(0) * stride_dim
     tl.store(dK_block_ptrs, dK_j)
-    dV_block_ptrs = dV_ptr + idx_block_col * stride_seq + offsets_col.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
+    dV_block_ptrs = dV_ptr + idx_block_col * stride_seq \
+                    + offsets_col.expand_dims(1) * stride_seq \
+                    + offsets_dim.expand_dims(0) * stride_dim
     tl.store(dV_block_ptrs, dV_j)
 
 
@@ -794,7 +803,7 @@ class TritonAttention(torch.autograd.Function):
             #                      (stride_batch,                       stride_heads,           stride_seq,     stride_dim)
 
         # pre-allocating our eventual output gradients
-        dQ = torch.empty_like(Q)
+        dQ = torch.zeros_like(Q) # since we use atomic_add to accumulate here directly, we use zeros instead of empty
         dK = torch.empty_like(K)
         dV = torch.empty_like(V)
 
@@ -824,7 +833,8 @@ class TritonAttention(torch.autograd.Function):
 
         """
         # our next kernel calculated dK and dV and uses a parallelization scheme similar to the previous, but 3D
-        grid = (SEQ_LEN // BLOCK_SIZE_MACRO, 1, BATCH_SIZE * NUM_HEADS)
+        #grid = (SEQ_LEN // BLOCK_SIZE_MACRO, 1, BATCH_SIZE * NUM_HEADS)
+        grid = (SEQ_LEN // BLOCK_SIZE_COL, 1, BATCH_SIZE * NUM_HEADS)
             # TODO why 3D and the 1? Isn't that the same number of PIDs but now you have to call the batch_heads ones with axis=2 instead of axis=1?
         
         stage = 3 if ctx.causal else 1 # TODO switch this to causal bool
@@ -836,11 +846,13 @@ class TritonAttention(torch.autograd.Function):
             M_ptr=M, D_ptr=D,
             stride_batch=Q.stride(0), stride_head=Q.stride(1), stride_seq=Q.stride(2), stride_dim=Q.stride(3),
             NUM_HEADS=NUM_HEADS, SEQ_LEN=SEQ_LEN,
-            BLOCK_SIZE_MACRO=BLOCK_SIZE_MACRO, BLOCK_SIZE_MICRO=BLOCK_SIZE_MICRO,
+            #BLOCK_SIZE_MACRO=BLOCK_SIZE_MACRO, BLOCK_SIZE_MICRO=BLOCK_SIZE_MICRO,
+            BLOCK_SIZE_MACRO=BLOCK_SIZE_COL, BLOCK_SIZE_MICRO=BLOCK_SIZE_ROW,
             HEAD_DIM=ctx.HEAD_DIM, # TODO again why we using ctx again?
             STAGE=stage, # TODO see using STAGE is confusing AF when pytorch already has num_stages
             num_warps=NUM_WARPS, num_stages=NUM_STAGES,
-        )#"""
+        )
+        #"""
 
         grid = (BATCH_SIZE * NUM_HEADS, SEQ_LEN // BLOCK_SIZE_COL)
         _attn_backward[grid](
@@ -855,7 +867,7 @@ class TritonAttention(torch.autograd.Function):
             HEAD_DIM=ctx.HEAD_DIM, # TODO again why we using ctx again?
             CAUSAL=ctx.causal,
             num_warps=NUM_WARPS, num_stages=NUM_STAGES,
-        )
+        )#"""
         
         # the None's are because pytorch expects a gradient for every input into .forward(), or a None if not applicable
         return dQ, dK, dV, None, None 
@@ -911,8 +923,8 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
     atol = 1e-2
     assert torch.allclose(ref_O, tri_out, atol=atol, rtol=rtol)
     assert torch.allclose(ref_dQ, tri_dQ, atol=atol, rtol=rtol), f"{ref_dQ}\n{tri_dQ}"
-    assert torch.allclose(ref_dK, tri_dK, atol=atol, rtol=rtol)#, f"{ref_dK}\n{tri_dK}"
-    assert torch.allclose(ref_dV, tri_dV, atol=atol, rtol=rtol)#, f"{ref_dV}\n{tri_dV}"
+    assert torch.allclose(ref_dK, tri_dK, atol=atol, rtol=rtol), f"{ref_dK}\n{tri_dK}"
+    assert torch.allclose(ref_dV, tri_dV, atol=atol, rtol=rtol), f"{ref_dV}\n{tri_dV}"
 
 
 
@@ -920,7 +932,7 @@ BATCH, N_HEADS, HEAD_DIM = 32, 32, 64 # LOWER THESE IF YOU DON'T HAVE ENOUGH RAM
 # vary seq length for fixed head and batch=4
 configs = []
 for mode in ["fwd", "bwd"]:
-    for causal in [True, False]:
+    for causal in [False]: #True, 
         configs.append(
             triton.testing.Benchmark(
                 x_names=["SEQ_LEN"],
