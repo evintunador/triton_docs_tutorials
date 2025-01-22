@@ -218,7 +218,7 @@ def _attn_bwd_dkdv(dk, dv,  #
     offs_k = tl.arange(0, HEAD_DIM)
     qT_ptrs = Q + offs_m[None, :] * stride_tok + offs_k[:, None] * stride_d
     do_ptrs = DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
-    # BLOCK_N1 must be a multiple of BLOCK_M1, otherwise the code wouldn't work.
+    # BLOCK_N1 must be a multiple of BLOCK_M1, otherwise the code wouldn't work. # TODO why tho?
     tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
     curr_m = start_m
     step_m = BLOCK_M1
@@ -338,7 +338,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     start_n = pid * BLOCK_N1
     start_m = start_n
 
-    MASK_BLOCK_M1: tl.constexpr = BLOCK_M1 // BLK_SLICE_FACTOR
+    MASK_BLOCK_M1: tl.constexpr = BLOCK_M1 // BLK_SLICE_FACTOR # TODO why are we cutting our block in half and how is this a mask?
     offs_n = start_n + tl.arange(0, BLOCK_N1)
 
     dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
@@ -477,11 +477,10 @@ class _attention(torch.autograd.Function):
         PRE_BLOCK = 128
         NUM_WARPS, NUM_STAGES = 4, 5
         BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
-        BLK_SLICE_FACTOR = 2
+        BLK_SLICE_FACTOR = 2 # TODO what is slice factor?
         RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
         arg_k = k
-        arg_k = arg_k * (ctx.sm_scale * RCP_LN2)
-        PRE_BLOCK = 128
+        arg_k = arg_k * (ctx.sm_scale * RCP_LN2) # TODO why do we need to scale keys by this?
         assert N_CTX % PRE_BLOCK == 0
         pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
         delta = torch.empty_like(M)
