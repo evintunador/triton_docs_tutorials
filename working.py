@@ -32,6 +32,8 @@ def _attn_fwd_inner(
     offsets_kv: tl.constexpr,
     SEQ_LEN: tl.constexpr,
 ):
+    tl.static_assert(BLOCK_SIZE_KV <= HEAD_DIM)
+
     # range of values handled by this stage
     if CAUSAL and DIAGONAL:
         # Used only for the block in which there is transition between non-masked and masked keys
@@ -72,11 +74,14 @@ def _attn_fwd_inner(
 
         # Compute the exponential of each safe dot product, which is the numerator of our softmax
         P_block = tl.math.exp(QK_block)
+        # P_block = tl.math.exp2(QK_block) 
+            # TODO try out .exp2(), should be faster & softmax should be invariant to it
 
         # Compute the sum by rows of the attention scores
         l_ij = tl.sum(P_block, 1) # 1 is the axis to compute sum along, so we get shape (BLOCK_SIZE_Q)
         # This is the correction factor for the previous l_i
         alpha = tl.math.exp(m_i - m_ij) # shape (BLOCK_SIZE_Q)
+            # TODO try out .exp2(), should be faster & softmax should be invariant to it
         # Apply the correction factor to the previous l_i and add the new l_ij
         l_i = l_i * alpha + l_ij
         
@@ -600,7 +605,6 @@ def _attn_backward(
     softmax_scale,
     dO_ptr, dQ_ptr, dK_ptr, dV_ptr,
     L_ptr, D_ptr,
-    locks_ptr,
     stride_batch, stride_head, stride_seq, stride_dim,
     NUM_HEADS, SEQ_LEN,
     BLOCK_SIZE_ROW: tl.constexpr, BLOCK_SIZE_COL: tl.constexpr,
@@ -625,7 +629,6 @@ def _attn_backward(
     dQ_ptr += offset_batch_head
     dK_ptr += offset_batch_head
     dV_ptr += offset_batch_head
-    Lock_ptr = locks_ptr + offset_batch_head
 
     # Make sure the pointers are in the right place w.r.t batch, head and sequence
     offset_batch_head_seq = (idx_batch_head * SEQ_LEN).to(tl.int64) # TODO stride_seq instead of SEQ_LEN?
@@ -658,6 +661,7 @@ def _attn_backward(
     #T_row = tl.cdiv(SEQ_LEN, BLOCK_SIZE_ROW)
     #for i in range(T_row): # TODO for causal mask it might make sense to use this loop version and j == i as the condition
     for i in range(0, SEQ_LEN, BLOCK_SIZE_ROW):
+        i = tl.multiple_of(i, BLOCK_SIZE_ROW)
 
         ### step 9
         # the ones of shape (BLOCK_SIZE_ROW, HEAD_DIM)
@@ -690,13 +694,12 @@ def _attn_backward(
 
         # step 15
         dQ_block_ptrs = dQ_ptr + i + offsets_row.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
-        #dQ_i = tl.load(dQ_block_ptrs)
+        dQ_i = tl.load(dQ_block_ptrs)
         delta = softmax_scale * tl.dot(dS_ji, K_j)
-        tl.atomic_add(dQ_block_ptrs, delta)
-        # TODO supposedly this is an alternative to implementing a lock but i'm not confident that it's working and my locks were getting stuck
+        tl.store(dQ_block_ptrs, dQ_i + delta)
 
         # step 16
-        dK_j = tl.dot(tl.trans(dS_ji), Q_i, acc=dK_j)
+        dK_j += tl.dot(tl.trans(dS_ji), Q_i)
 
     dK_block_ptrs = dK_ptr + idx_block_col * stride_seq + offsets_col.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
     tl.store(dK_block_ptrs, dK_j)
@@ -841,11 +844,6 @@ class TritonAttention(torch.autograd.Function):
             STAGE=stage, # TODO see using STAGE is confusing AF when pytorch already has num_stages
             num_warps=NUM_WARPS, num_stages=NUM_STAGES,
         )#"""
-        locks = torch.zeros(
-            (BATCH_SIZE, HEAD_DIM, SEQ_LEN // BLOCK_SIZE_COL), 
-            dtype=torch.int32, 
-            device=DEVICE
-        )
 
         grid = (BATCH_SIZE * NUM_HEADS, SEQ_LEN // BLOCK_SIZE_COL)
         _attn_backward[grid](
@@ -854,7 +852,6 @@ class TritonAttention(torch.autograd.Function):
             dO_ptr=dO, dQ_ptr=dQ, dK_ptr=dK, dV_ptr=dV,
             L_ptr=M, # TODO make max & logsumexp notation consistent
             D_ptr=D,
-            locks_ptr=locks,
             stride_batch=Q.stride(0), stride_head=Q.stride(1), stride_seq=Q.stride(2), stride_dim=Q.stride(3),
             NUM_HEADS=NUM_HEADS, SEQ_LEN=SEQ_LEN,
             BLOCK_SIZE_ROW=BLOCK_SIZE_ROW, BLOCK_SIZE_COL=BLOCK_SIZE_COL,
