@@ -32,8 +32,6 @@ def _attn_fwd_inner(
     offsets_kv: tl.constexpr,
     SEQ_LEN: tl.constexpr,
 ):
-    tl.static_assert(BLOCK_SIZE_KV <= HEAD_DIM)
-
     # range of values handled by this stage
     if CAUSAL and DIAGONAL:
         # Used only for the block in which there is transition between non-masked and masked keys
@@ -612,14 +610,14 @@ def _attn_backward(
     CAUSAL: tl.constexpr,
 ):
     # selecting which pid we are in respect to BATCH_SIZE and NUM_HEADS
-    idx_batch_head = tl.program_id(0) # TODO see why do we need a 3D launch grid?!
+    idx_batch_head = tl.program_id(0)
     idx_batch = idx_batch_head // NUM_HEADS # getting the sequence in the batch this pid is assigned to
     idx_head = idx_batch_head % NUM_HEADS # getting the head this pid is assigned to
 
     # This offset allows us to select the right (SEQ_LEN, HEAD_DIM) matrix from a tensor of shape 
     #  (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM) given the batch and head
-    offset_batch_head = (stride_batch * idx_batch + stride_head * idx_head).to(tl.int64)
-        # TODO i presume int64 is bc BATCH_SIZE * NUM_HEADS could legitimately exhaust int64's representation range?
+    offset_batch_head = (idx_batch * stride_batch + idx_head * stride_head).to(tl.int64)
+        # TODO i presume int64 is bc BATCH_SIZE * NUM_HEADS could legitimately exhaust int32's representation range?
     # The reason we don't access the blocks through the automated method make_block_ptr is because we need to use the range of 
     #  offsets to apply the masking, meaning there are times when building pointers manually provides more control
     Q_ptr += offset_batch_head
@@ -630,14 +628,15 @@ def _attn_backward(
     dK_ptr += offset_batch_head
     dV_ptr += offset_batch_head
 
-    # Make sure the pointers are in the right place w.r.t batch, head and sequence
-    offset_batch_head_seq = (idx_batch_head * SEQ_LEN).to(tl.int64) # TODO stride_seq instead of SEQ_LEN?
+    # This offset allows us to select the right (SEQ_LEN) vector from a tensor of shape 
+    #  (BATCH_SIZE, NUM_HEADS, SEQ_LEN) given the batch and head
+    #offset_batch_head_seq = (idx_batch_head * SEQ_LEN).to(tl.int64) # TODO is this original correct or my new line below?
+    offset_batch_head_seq = (idx_batch * NUM_HEADS * SEQ_LEN + idx_head * SEQ_LEN).to(tl.int64) # using NUM_HEADS & SEQ_LEN to manually calculate stride
     L_ptr += offset_batch_head_seq
     D_ptr += offset_batch_head_seq
-        # these two are different from the group above because they're of shape (BATCH_SIZE, HEAD_DIMS, SEQ_LEN)
 
+    # selecting which pid we are in respect to column splits of the (SEQ_LEN, SEQ_LEN) attention matrix
     idx_block = tl.program_id(1)
-    idx_block_row = idx_block * BLOCK_SIZE_ROW
     idx_block_col = idx_block * BLOCK_SIZE_COL
 
     offsets_row = tl.arange(0, BLOCK_SIZE_ROW)
@@ -667,8 +666,6 @@ def _attn_backward(
         # the ones of shape (BLOCK_SIZE_ROW, HEAD_DIM)
         Q_block_ptrs = Q_ptr + i + offsets_row.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
         Q_i = tl.load(Q_block_ptrs)
-        #O_block_ptrs = O_ptr + i + offsets_row.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
-        #O_i = tl.load(O_block_ptrs)
         dO_block_ptrs = dO_ptr + i + offsets_row.expand_dims(1) * stride_seq + offsets_dim.expand_dims(0) * stride_dim
         dO_i = tl.load(dO_block_ptrs)
         # the ones of shape (BLOCK_SIZE_ROW)
@@ -813,7 +810,7 @@ class TritonAttention(torch.autograd.Function):
 
         # so as usual we combine batch_size & num_heads along the same parallelization axis
         # and here our preprocessing will also parallelize within the sequence length
-        preprocess_grid = (SEQ_LEN // BLOCK_SIZE_ROW, BATCH_SIZE * NUM_HEADS)
+        preprocess_grid = (BATCH_SIZE * NUM_HEADS, SEQ_LEN // BLOCK_SIZE_ROW)
         D = torch.empty_like(M)  # Shape: (BATCH_SIZE, NUM_HEADS, SEQ_LEN)
             # TODO why do we call it D? what's its purpose?
 
@@ -913,9 +910,9 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
     rtol = 0.0
     atol = 1e-2
     assert torch.allclose(ref_O, tri_out, atol=atol, rtol=rtol)
-    assert torch.allclose(ref_dQ, tri_dQ, atol=atol, rtol=rtol)#, f"{ref_dQ}\n{tri_dQ}"
-    assert torch.allclose(ref_dV, tri_dV, atol=atol, rtol=rtol)#, f"{ref_dV}\n{tri_dV}"
+    assert torch.allclose(ref_dQ, tri_dQ, atol=atol, rtol=rtol), f"{ref_dQ}\n{tri_dQ}"
     assert torch.allclose(ref_dK, tri_dK, atol=atol, rtol=rtol)#, f"{ref_dK}\n{tri_dK}"
+    assert torch.allclose(ref_dV, tri_dV, atol=atol, rtol=rtol)#, f"{ref_dV}\n{tri_dV}"
 
 
 
