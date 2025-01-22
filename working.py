@@ -342,9 +342,9 @@ def _attn_backward_preprocess(
     HEAD_DIM: tl.constexpr,
 ):
     """the job of this kernel is to pre-compute D since D is used by both of the following two kernels"""
-    block_index_q = tl.program_id(0) # SEQ_LEN / BLOCK_SIZE_Q number of pids
+    block_index_q = tl.program_id(1) # SEQ_LEN / BLOCK_SIZE_Q number of pids
     offsets_q = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
-    index_batch_head = tl.program_id(1) # BATCH_SIZE * NUM_HEADS number of pids
+    index_batch_head = tl.program_id(0) # BATCH_SIZE * NUM_HEADS number of pids
     offsets_dim = tl.arange(0, HEAD_DIM)
 
     # Load BLOCK_SIZE_Q rows of O
@@ -610,7 +610,7 @@ def _attn_backward(
     CAUSAL: tl.constexpr,
 ):
     # selecting which pid we are in respect to BATCH_SIZE and NUM_HEADS
-    idx_batch_head = tl.program_id(0)
+    idx_batch_head = tl.program_id(1)
     idx_batch = idx_batch_head // NUM_HEADS # getting the sequence in the batch this pid is assigned to
     idx_head = idx_batch_head % NUM_HEADS # getting the head this pid is assigned to
 
@@ -636,7 +636,7 @@ def _attn_backward(
     D_ptr += offset_batch_head_seq
 
     # selecting which pid we are in respect to column splits of the (SEQ_LEN, SEQ_LEN) attention matrix
-    idx_block = tl.program_id(1) # AKA our 'j' idx
+    idx_block = tl.program_id(0) # AKA our 'j' idx
     idx_block_col = idx_block * BLOCK_SIZE_COL
 
     offsets_row = tl.arange(0, BLOCK_SIZE_ROW)
@@ -819,7 +819,7 @@ class TritonAttention(torch.autograd.Function):
 
         # so as usual we combine batch_size & num_heads along the same parallelization axis
         # and here our preprocessing will also parallelize within the sequence length
-        preprocess_grid = (BATCH_SIZE * NUM_HEADS, SEQ_LEN // BLOCK_SIZE_ROW)
+        preprocess_grid = (SEQ_LEN // BLOCK_SIZE_ROW, BATCH_SIZE * NUM_HEADS)
         D = torch.empty_like(M)  # Shape: (BATCH_SIZE, NUM_HEADS, SEQ_LEN)
             # TODO why do we call it D? what's its purpose?
 
@@ -854,7 +854,7 @@ class TritonAttention(torch.autograd.Function):
         )
         #"""
 
-        grid = (BATCH_SIZE * NUM_HEADS, SEQ_LEN // BLOCK_SIZE_COL)
+        grid = (SEQ_LEN // BLOCK_SIZE_COL, BATCH_SIZE * NUM_HEADS)
         _attn_backward[grid](
             Q_ptr=Q, K_ptr=K, V_ptr=V,
             softmax_scale=ctx.softmax_scale,
