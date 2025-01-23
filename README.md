@@ -1,9 +1,10 @@
 # triton_docs_tutorials **(WIP)**
-making the official triton tutorials actually comprehensible by *heavily* commenting in-detail about every little thing that's happening
-https://triton-lang.org/main/getting-started/tutorials/index.html
+making the [official triton documentation tutorials](https://triton-lang.org/main/getting-started/tutorials/index.html) actually comprehensible by *heavily* commenting in-detail about every little thing that's happening
 
-## why triton?
-You might be asking: why are we using Triton instead of CUDA? I'm open to the idea of learning and then doing a lesson on CUDA (and MPS for that matter) in the future, but for now here are the pros and cons that it came down to:
+*this repo is currently a work-in-progress. i've personally finished the tutorials and commented pretty heavily on these, but they're not what I'd deem "presentable". currently I'm working on building an entire [autograd engine using only Triton to define all operations]() and will return to this repo when I'm done. the logic behind that decision is that I think teachers should know a significant amount more than what they're teaching, so I figure building an entire autograd engine is a good way to ensure that is the case*
+
+## why Triton instead of CUDA?
+I'm open to the idea of learning and then doing a lesson on CUDA (and MPS for that matter) in the future, but for now here are the pros and cons that it came down to:
 
 |      | triton                                                                                            | cuda                                                             |
 | ---- | ------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
@@ -17,9 +18,9 @@ Personally I'm on a Mac so i plan on doing all my work on a cloud provider like 
 ## how to get up and running
 these instructions are for setting up a cloud GPU instance on [lambdalabs](https://lambdalabs.com); other cloud providers should be similar. If you're running linux on your own pc with your own GPU then it should be obvious which of these steps to skip. 
 
-1. setup an account on [lambdalabs](https://lambdalabs.com) or similar provider, including putting in your payment info
+1. setup an account on [lambdalabs](https://lambdalabs.com) or similar provider
 2. launch a GPU instance. You can choose whichever single GPU is cheapest (I can always find one for less than $1/hr)
-3. once it's running, open the jupyter lab environment (Lambda provides this; i presume others do too). Optionally you could instead ssh into the instance in order to be able to use your own IDE
+3. once it's running, open the included remote jupyter lab environment (Lambda provides this and i presume others do too). Optionally you could instead ssh into the instance in order to be able to use your own IDE
 4. Open the terminal in your instance and install github CLI
 ```
 sudo apt update
@@ -49,15 +50,15 @@ pip install numpy matplotlib pandas torch triton
 ```
 
 ## learning resources I used
-here's someone else's helpful attempt at explaining the official docs but every fifth line from them was "idk what this does"
-- https://isamu-website.medium.com/understanding-the-triton-tutorials-part-1-6191b59ba4c
-- https://isamu-website.medium.com/understanding-triton-tutorials-part-2-f6839ce50ae7
+of course the official Triton documentation
+- https://triton-lang.org/main/getting-started/tutorials/index.html
 
-here's a flash-attention implementation by one of my fav youtubers
+here's a flash-attention implementation by one of my fav youtubers that comes with an 8hr video
 - https://github.com/hkproj/triton-flash-attention
 
-meta's xformers repo implements basically everything one could need
-- https://github.com/facebookresearch/xformers
+and the original flash-attention papers (you only really need v2)
+- https://arxiv.org/abs/2205.14135
+- https://arxiv.org/abs/2307.08691
 
 here's a wider set of GPU kernel guides that includes an intro to Triton in lesson 14
 - https://github.com/gpu-mode/lectures/tree/main
