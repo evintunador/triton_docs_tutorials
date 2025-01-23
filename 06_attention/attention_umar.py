@@ -1,3 +1,12 @@
+"""
+this is a fused-attention implementation implemented by Umar Jamil. See his 8 hour tutorial for an alternative to mine
+https://github.com/hkproj/triton-flash-attention
+
+he built it based on the official triton documentation implementation, but the edits he made in the name of 
+learnability also made it slower in the backward pass
+"""
+
+
 import torch
 
 import triton
@@ -715,7 +724,67 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
     assert torch.allclose(ref_dQ, tri_dQ, atol=atol, rtol=rtol)
 
 
+
+BATCH, N_HEADS, HEAD_DIM = 2, 8, 64
+# vary seq length for fixed head and batch=4
+configs = []
+for mode in ["fwd", "bwd"]:
+    for causal in [True, False]:
+        #if mode == "bwd" and not causal:
+            #continue
+        configs.append(
+            triton.testing.Benchmark(
+                x_names=["N_CTX"],
+                x_vals=[2**i for i in range(8, 13)],
+                line_arg="provider",
+                line_vals=["triton", 'torch'],
+                line_names=["Triton", 'torch'],
+                styles=[("red", "-"), ("blue", "-")],
+                ylabel="TFLOPS",
+                plot_name=f"attn-umar-{mode}-causal={causal}",
+                args={
+                    "H": N_HEADS,
+                    "BATCH": BATCH,
+                    "HEAD_DIM": HEAD_DIM,
+                    "mode": mode,
+                    "causal": causal,
+                },
+            ))
+
+
+@triton.testing.perf_report(configs)
+def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, mode, provider, device=DEVICE):
+    assert mode in ["fwd", "bwd"]
+    dtype = torch.float16
+    q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    sm_scale = 1.3
+    if provider == 'triton':
+        fn = lambda: attention(q, k, v, causal, sm_scale)
+    if provider == 'torch':
+        fn = lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal)
+    if mode == "bwd":
+        o = fn()
+        do = torch.randn_like(o)
+        fn = lambda: o.backward(do, retain_graph=True)
+    ms = triton.testing.do_bench(fn)
+    flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
+    total_flops = 2 * flops_per_matmul
+    if causal:
+        total_flops *= 0.5
+    if mode == "bwd":
+        total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
+    return total_flops * 1e-12 / (ms * 1e-3)
+
+
+
 if __name__ == "__main__":
     test_op(BATCH_SIZE=4, NUM_HEADS=8, SEQ_LEN=1024, HEAD_DIM=64, causal=True)
     test_op(BATCH_SIZE=4, NUM_HEADS=8, SEQ_LEN=1024, HEAD_DIM=64, causal=False)
     print("PASSED")
+
+    # Only run benchmark if explicitly requested
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--benchmark":
+        bench_flash_attention.run(save_path='.', print_data=False)

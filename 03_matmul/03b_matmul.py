@@ -233,4 +233,4 @@ def benchmark(M, N, K, provider):
         # 1e-12 converts flops to Teraflops
         # ms * 1e-3 converts milliseconds to seconds
     return perf(ms), perf(max_ms), perf(min_ms)
-benchmark.run(print_data=True, save_path='./benchmark_results/')
+benchmark.run(print_data=False, save_path='.')

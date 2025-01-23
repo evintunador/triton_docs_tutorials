@@ -224,4 +224,4 @@ def benchmark(M, N, provider):
         # ms * 1e-3 converts milliseconds to seconds
     return gbps(ms)
 
-benchmark.run(print_data=True, save_path='./benchmark_results/')
+benchmark.run(print_data=False, save_path='.')

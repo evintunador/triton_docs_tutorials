@@ -1,12 +1,8 @@
 """
-this is a triton implementation of flash-attention 2
+this is a custom fused-attention implementation in Triton that is similar to flash-attention 2
 https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html
-TODO i suspect it's not as efficient as the one in pytorch since the benchmark doesn't include it
 
-# for some reason it only works on post-Ampere GPUs (inclusive) (like the A100, which came out in 2020)
-
-see also Umar's 7 hour long video where he breaks it down in HEAVY detail
-https://github.com/hkproj/triton-flash-attention
+note: they mentioned that for some reason it only works on post-Ampere GPUs (inclusive) (like the A100, which came out in 2020)
 """
 import pytest
 import torch
@@ -566,7 +562,7 @@ for mode in ["fwd", "bwd"]:
                 line_names=["Triton", 'torch'],
                 styles=[("red", "-"), ("blue", "-")],
                 ylabel="TFLOPS",
-                plot_name=f"fused_attention-official_docs-{mode}-causal={causal}",
+                plot_name=f"attn-official_docs-{mode}-causal={causal}",
                 args={
                     "H": N_HEADS,
                     "BATCH": BATCH,
@@ -603,4 +599,13 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, mode, provider, dev
     return total_flops * 1e-12 / (ms * 1e-3)
 
 
-bench_flash_attention.run(save_path='./benchmark_results/', print_data=True)
+if __name__ == "__main__":
+    # always run unit-tests
+    test_op(BATCH_SIZE=1, NUM_HEADS=1, SEQ_LEN=256, HEAD_DIM=64, causal=True)
+    test_op(BATCH_SIZE=1, NUM_HEADS=1, SEQ_LEN=256, HEAD_DIM=64, causal=False)
+    print("PASSED")
+
+    # Only run benchmark if explicitly requested
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--benchmark":
+        bench_flash_attention.run(save_path='.', print_data=False)

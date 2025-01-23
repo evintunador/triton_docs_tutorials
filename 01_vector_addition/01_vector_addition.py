@@ -125,4 +125,4 @@ def benchmark(size, provider):
         # 1e-9 converts bytes to GB
         # ms * 1e-3 converts milliseconds to seconds
     return gbps(ms), gbps(max_ms), gbps(min_ms)
-benchmark.run(print_data=True, save_path='./benchmark_results/') # show_plots=True, 
+benchmark.run(print_data=False, save_path='.') # show_plots=True, 
