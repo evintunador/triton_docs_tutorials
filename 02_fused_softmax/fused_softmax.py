@@ -1,6 +1,16 @@
 """
-this "fused softmax" operation will be significantly faster than pytorch's native op
- for a particular class of matrices: those whose rows can fit in the GPU's SRAM
+This "fused softmax" operation will be significantly faster than pytorch's native op
+ for a particular class of matrices: those whose rows can fit in the GPU's SRAM.
+ 
+What you'll learn:
+- The importance of reducing memory reads/writes
+- How to fuse multiple operations into one kernel to reduce memory reads/writes
+- How to fetch GPU specifications
+- Some parts of the GPU architecture that you don't usually have to think about 
+    when writing Triton kernels
+- How to define meta-parameters using GPU-specific attributes and rough heuristics
+- Pipeline parallelism & the weird way that for-loops work within GPU kernels
+- How to choose the value of extra entries when masking
 
 see original
 https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html
@@ -35,7 +45,6 @@ def naive_softmax(x):
     # in total we did 8MN + 4M memory operations
     # (read 5MN + 2M elements; wrote 3MN + 2M elements)
     return out
-
 """
 that's a whole lot of memory operations. we'd prefer to have a custom "fused" kernel that only 
 reads x from DRAM once and does all the necessary computations on SRAM as opposed to repeatedly 
@@ -54,58 +63,56 @@ note an important limitation of Triton is that each block must have a power-of-t
 """
 
 ######### Step 4 #########
-@triton.jit # this decorator tells Triton to compile this function into GPU code
-def _softmax_kernel(input_ptr, output_ptr, # raw memory pointers to input and output data
-                    input_row_stride, output_row_stride, # number of elements to skip when moving to next row
-                    n_rows, n_cols, # matrix dimensions
-                    BLOCK_SIZE: tl.constexpr, # power-of-2 size for processing blocks
-                    num_stages: tl.constexpr): 
-    # num_stages relates to overlapping memory operations with computation operations;
-    # when one piece of data is being processed, the GPU can simultaneously load the next piece
-    # more stages -> more overlapping, but requires more memory
-    # tl.constexpr is a type that tells the compiler that the value must be known at compile-time (not runtime)
-    
-    # there are multiple "programs" processing data (a program is a unique instantiation of this kernel)
-    # programs can be defined along multiple dimensions when the inputs have multiple dimensions
-    # this op is 1D so axis=0 is the only option, but bigger operations later may define pid as a tuple
-    # here we identify which program we are:
+@triton.jit 
+def _softmax_kernel(
+    input_ptr, output_ptr,
+    input_row_stride, output_row_stride,    # number of elements to skip when moving to next row
+    n_rows, n_cols,                         # matrix dimensions
+    BLOCK_SIZE: tl.constexpr,               # lowest power-of-2 greater than n_cols
+    num_stages: tl.constexpr,
+): 
+    # the row that this program starts with is defined by the pid
     row_start = tl.program_id(0) 
-    # then this gets the total number of parallel programs
+    # then this gets the total number of parallel programs, which we'll use to know how large 
+    #  of a step to make in our for loop once we finish the first row
     row_step = tl.num_programs(0) 
         # Each program processes rows strided by row_step 
         # (ex. if there are 4 programs, program 0 handles rows 0,4,8...)
     
+    # whereas tl.arange() provides an array of values, tl.range() acts as an iterator
     for row_idx in tl.range(row_start, n_rows, row_step, num_stages=num_stages):
+        # rather than actually implement each iteration of the for loop sequentially, triton can use
+        #  num_stages to work on different interations of the for loop simultaneously. Of course
+        #  only do this when the iterations don't depend on each other
+        
         # the stride represents how much we need to increase the pointer to advance 1 row
         row_start_ptr = input_ptr + row_idx * input_row_stride
-            # if intuitively you think that input_row_stride should be 1, then in this case you're right,
-            #  but what if a view of a manipulated tensor were passed in? for example, if our matrix's rows
-            #  were twice the size of what conveniently fits in SRAM, then we'd make a view of that matrix
-            #  where each row is split into two rows in order to take advantage of this kernel. we don't 
-            #  actually take advantage of this idea in this code; rather we're just writing it this way 
-            #  to prepare ourselves for good practices in future lessons
-        # the block size is the next power of two greater than n_cols, 
-        #   so we can fit each row in a single block
-        col_offsets = tl.arange(0, BLOCK_SIZE)
+            # inyuiyively input_row_stride should be 1 as long as the input tensor is contiguous.
+            #  but what if a non-contiguous view of a manipulated tensor were passed in? then
+            #  input_row_stride matters
+
+        # load the row into SRAM, using a mask since BLOCK_SIZE is > than n_cols if n_cols is not a power of 2
+        col_offsets = tl.arange(0, BLOCK_SIZE) # we can fit each row in a single block
         input_ptrs = row_start_ptr + col_offsets
-        # load the row into SRAM, using a mask since BLOCK_SIZE may be > than n_cols
         mask = col_offsets < n_cols
-        row = tl.load(input_ptrs, mask=mask, other=-float('inf')) # fill in masked out indices with -inf
+        row = tl.load(input_ptrs, mask=mask, other=float('-inf')) 
+            # we fill in masked out indices with -inf since that's the value that won't influence softmax
+
         # subtract maximum for numerical stability
         row_minus_max = row - tl.max(row, axis=0)
             # all the invalid -inf values remain -inf when we subtract the max
-        # note that exponentiation in Triton is fast but approximate
+        # note that exponentiation in Triton is fast but approximate; later we'll learn an even faster alternative
         numerator = tl.exp(row_minus_max)
             # all the -inf values get set to 0 since exp(-inf)=0
         denominator = tl.sum(numerator, axis=0)
             # all the invalid 0 values do get summed but don't matter since they're 0
         softmax_output = numerator / denominator
             # all the invalid 0's are 0/sum and therefore remain 0
+
         # write output back to DRAM
         output_row_start_ptr = output_ptr + row_idx * output_row_stride
-        output_ptrs = output_row_start_ptr + col_offsets
-        tl.store(output_ptrs, softmax_output, mask=mask)
-            # using our mask we only store back the valid values
+        tl.store(output_row_start_ptr + col_offsets, softmax_output, mask=mask)
+            # using our mask we only store back the valid n_cols values
 
 ######### Step 3 #########
 """
@@ -259,12 +266,16 @@ def test_softmax_kernel(size: tuple, atol=1e-3, rtol=1e-3, device=DEVICE):
         styles=[('blue', '-'), ('green', '-')],
         ylabel="GB/s",
         plot_name="softmax-performance",
-        args={'M': 4096} # values for function arguments not in x_names and y_name
+        args={'M': 4096} # values for function arguments not in x_names
     ))
 def benchmark(M, N, provider):
+    # making the input data
     x = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
+
+    # these two lines ensure more accurate benchmarks; i usually forget to use them but it's not a big deal
     stream = getattr(torch, DEVICE.type).Stream()
     getattr(torch, DEVICE.type).set_stream(stream)
+
     if provider == 'torch':
         ms = triton.testing.do_bench(lambda: torch.softmax(x, axis=-1))
     if provider == 'triton':
@@ -274,7 +285,7 @@ def benchmark(M, N, provider):
         # x.numel() = number of elements
         # x.element_size() = bytes per element (4 for float32)
         # 1e-9 converts bytes to GB
-        # ms * 1e-3 converts milliseconds to seconds
+        # 1e-3 converts milliseconds to seconds
     return gbps(ms)
 
 if __name__ == "__main__":

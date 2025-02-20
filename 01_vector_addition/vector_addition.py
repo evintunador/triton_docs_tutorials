@@ -1,4 +1,12 @@
 """
+In this document we'll implement basically the simplest possible Triton GPU Kernel, which does entry-wise
+addition for vectors. 
+
+What you'll learn:
+- How to build a test to ensure your Triton kernels are numerically correct
+- Basics of Triton kernels (syntax, pointers, launch grids, DRAM vs SRAM, etc)
+- How to benchmark your Triton kernels against PyTorch
+
 see original
 https://triton-lang.org/main/getting-started/tutorials/01-vector-add.html#sphx-glr-getting-started-tutorials-01-vector-add-py
 """
@@ -7,7 +15,8 @@ import triton
 import triton.language as tl
 DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
-# this decorator tells Triton to compile this function into GPU code
+######### Step 3 #########
+# this `triton.jit` decorator tells Triton to compile this function into GPU code
 @triton.jit # only a subset of python capabilities are useable within a triton kernel
 def add_kernel(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr): 
     """
@@ -83,6 +92,7 @@ def add_kernel(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
         # here is a memory write operation of size BLOCK_SIZE per pid and therefore n_elements 
         # in aggregate across all pids combined
 
+######### Step 2 #########
 def add(x: torch.Tensor, y: torch.Tensor):
     '''
     helper/wrapper function to 
@@ -125,6 +135,7 @@ def add(x: torch.Tensor, y: torch.Tensor):
     # once all the kernel programs have finished running then the output gets returned here
     return output
 
+######### Step 1 #########
 def test_add_kernel(size, atol=1e-3, rtol=1e-3, device=DEVICE):
     """
     Here is where we test the wrapper function and kernel that we wrote 
@@ -142,7 +153,7 @@ def test_add_kernel(size, atol=1e-3, rtol=1e-3, device=DEVICE):
     torch.testing.assert_close(z_tri, z_ref, atol=atol, rtol=rtol)
     print("PASSED")
 
-# BENCHMARK
+######### Step 4 #########
 # Triton has a set of built-in utilities that make it easy for us to plot performance of custom ops.
 # This decorator tells Triton that the below function is a benchmark and what benchmark conditions to run
 @triton.testing.perf_report(
