@@ -1,3 +1,24 @@
+'''
+This "naive" matmul kernel will be significantly slower than the following version, but matmul
+ is sufficiently complicated that I think it's necessary to show this simpler version first
+
+ What you'll learn:
+- Multi-dimensional pointer arithmetic
+- Automatic performance tuning
+
+this is the algorithm our code will roughly be implementing, but in parallel
+for m in range(0, M, BLOCK_SIE_M): # do in parallel
+    for n in range(0, N, BLOCK_SIZE_N): # do in parallel
+        acc = zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=float32)
+        for k in range(0, K, BLOCK_SIZE_K):
+            a = A[m : m+BLOCK_SIZE_M, k : k+BLOCK_SIZE_K]
+            b = B[k : k+BLOCK_SIZE_K, n : n+BLOCK_SIZE_N]
+            acc += dot(a,b)
+        C[m : m+BLOCK_SIZE_M, n : n+BLOCK_SIZE_N] = acc
+
+see original
+https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html
+'''
 import torch
 import triton
 import triton.language as tl

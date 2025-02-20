@@ -1,7 +1,7 @@
 """
-This "fused softmax" operation will be significantly faster than pytorch's native op
+This "fused softmax" kernel will be significantly faster than pytorch's native op
  for a particular class of matrices: those whose rows can fit in the GPU's SRAM.
- 
+
 What you'll learn:
 - The importance of reducing memory reads/writes
 - How to fuse multiple operations into one kernel to reduce memory reads/writes

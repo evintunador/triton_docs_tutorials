@@ -1,11 +1,15 @@
-'''
-we'll learn about
-- block-level matmuls
-- multi-dimensional pointer arithmetic
-- program re-ordering for improved SRAM hit rate
-- automatic performance tuning
+"""
+This matmul kernel can be a bit confusing but is very crucial to understand
 
-this is the algorithm our code will roughly be implementing, but in parallel
+ What you'll learn:
+- Multi-dimensional pointer arithmetic
+- Automatic performance tuning
+- High precision data type accumulation
+- Program re-ordering for improved SRAM hit rate
+
+For matmul of A @ B = C of shapes (M, K) @ (K, N) = (M, N), the following
+algorithm is numerically equivalent to what our code will output, but we'll
+get to the answer in a different way
 for m in range(0, M, BLOCK_SIE_M): # do in parallel
     for n in range(0, N, BLOCK_SIZE_N): # do in parallel
         acc = zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=float32)
@@ -14,18 +18,20 @@ for m in range(0, M, BLOCK_SIE_M): # do in parallel
             b = B[k : k+BLOCK_SIZE_K, n : n+BLOCK_SIZE_N]
             acc += dot(a,b)
         C[m : m+BLOCK_SIZE_M, n : n+BLOCK_SIZE_N] = acc
-'''
+
+see original
+https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html
+"""
 import torch
 import triton
 import triton.language as tl
-
 DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
-# this is just setting up a bunch of different potential config files that we'll choose from later based
-# on how well they perform on our specific GPU. Triton will figure out which to use for us. They're all values chosen
-# heuristically, but notice everything is a multiple of 32 in sticking w/ the number of threads in a warp.
-# we only choose the config once and with respect to our hardware; once chosen it does not care what the input tensor sizes are
-autotude_configs = [
+######### Step 3 #########
+# autotuning is just setting up a bunch of different potential meta-parameters configurations that Triton will automatically
+# choose from later based on which one performs best on our specific GPU. Triton will figure out for us which one to use. They're 
+# all values chosen heuristically, but notice everything is a multiple of 32 in sticking w/ the number of threads in a warp.
+autotune_configs = [
     triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE': 8}, num_stages=3, num_warps=8),
     triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=4, num_warps=4),
     triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=4, num_warps=4),
@@ -35,18 +41,15 @@ autotude_configs = [
     triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=5, num_warps=2),
     triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=5, num_warps=2)
 ]
-# notice that given all these parameters, if we had tried every single combination of them we would've ended up with over 280 possibilities
-# (way more than 8). if you really need the final runtime speedup AND you don't already have a good heuristic list like this one, you could
-# brute-force the autotune. these were heuristically chosen by someone who understands GPU architecture (not me)
-
 # `triton.jit`'ed functions can be auto-tuned by using the `triton.autotune` decorator which consumes
-#   - a list of `triton.Config` objects that define different configs of meta-parameters and compilation options
-#   - an auto-tuning *key* whose change in values will trigger evaluation of all the provided configs
-@triton.autotune(configs = autotude_configs, key=['M', 'N', 'K'])
+#   1) a list of `triton.Config` objects that define different configs of meta-parameters and compilation options
+#   2) an auto-tuning *key* whose change in values will trigger a new evaluation of all the provided configs, meaning
+#       that any time either M, N, or K changes with a new input, Triton will check which config is best all over again
+@triton.autotune(configs = autotune_configs, key=['M', 'N', 'K'])
 @triton.jit
 def _matmul_kernel(
-    a_ptr, b_ptr, c_ptr, # pointers to first entries of matrices
-    M, N, K, # matrix dimensions
+    a_ptr, b_ptr, c_ptr, 
+    M, N, K, 
     stride_am, stride_ak, # how much to increase the ptr by when moving by 1 element along that dimension
     stride_bk, stride_bn, # ex: increase b_ptr by stride_bk to get the element one row down (B has K rows)
     stride_cm, stride_cn,
@@ -146,9 +149,6 @@ def _matmul_kernel(
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
-    # you can fuse arbitrary activation functions here while the accumulator is still in FP32
-    if ACTIVATION == "leaky_relu":
-        accumulator = leaky_relu(accumulator)
     accumulator = accumulator.to(tl.float16)
 
     # write back the block of the output matrix C with masks
@@ -158,51 +158,55 @@ def _matmul_kernel(
     c_mask = (offsets_cm.expand_dims(1) < M) & (offsets_cn.expand_dims(0) < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
-# we can fuse a nonlinearity (here `leaky_relu`) by providing it as an `ACTIVATION` 
-#  meta-parameter in `_naive_matmul_kernel`
-@triton.jit
-def leaky_relu(x):
-    return tl.where(x >= 0, x, 0.01 * x)
 
-# now our wrapper function is relatively simple compared to the previous two lessons
-def matmul(a, b, activation=""):
+######### Step 2 #########
+def matmul(a, b):
     # check constraints
     assert a.ndim == b.ndim == 2, "only supports matrices, not vectors or tensors"
     assert a.shape[1] == b.shape[0], "incompatible dimensions"
-    assert a.is_contiguous(), "matrix A must be contiguous" # Returns True if tensor is contiguous in memory
-        # i think this means that all elements are lined up back-to-back without interruption in memory
-        # needs to be true so that our indexing makes sense
+    #assert a.is_contiguous() and b.is_contiguous, "input matrices must be contiguous"
+    a, b = a.to(torch.float16), b.to(torch.float16)
     
     # get dimesion lengths
-    (m, k), (_, n) = a.shape, b.shape
+    (M, K), (_, N) = a.shape, b.shape
 
     # allocates output
-    c = torch.empty((m, n), device=a.device, dtype=torch.float16)
+    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
     
-    # 1D launch kernel where each block gets its own program
+    # 1D launch kernel where each block gets its own program; this is explained inside the kernel
     grid = lambda meta: (triton.cdiv(m, meta['BLOCK_SIZE_M']) * triton.cdiv(n, meta['BLOCK_SIZE_N']), )
     _matmul_kernel[grid](
         a, b, c,
-        m, n, k,
-        a.stride(0), a.stride(1), # the jump necessary to go from one element to the next one in that dimension
+        M, N, K,
+        a.stride(0), a.stride(1),
         b.stride(0), b.stride(1),
         c.stride(0), c.stride(1),
-        ACTIVATION=activation # not used by default since "" is being passed in
     )
     return c
 
-# unit test
-torch.manual_seed(0)
-a = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
-b = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
-triton_output = matmul(a, b)
-torch_output = torch.matmul(a, b)
-print(f"triton_output={triton_output}")
-print(f"torch_output={torch_output}")
-if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=0):
-    print("✅ Triton and Torch match")
-else:
-    print("❌ Triton and Torch differ")
+######### Step 1 #########
+def test_matmul_kernel(size: tuple, atol=1e-2, rtol=1e-1, device=DEVICE): # TODO does rtol=0 mean we don't use rtol?
+    """
+    Here is where we test the wrapper function and kernel that we wrote 
+    above to ensure all our values are correct, using pytorch as the 
+    correct answer to compare against
+
+    We use higher tolerance values than previous tests because all the flop 
+    accumulation can really compound when it comes to a matmul; even slight
+    differences in the block size and launch grid ordering from what PyTorch 
+    does can result in pretty sizeable discrepancies
+    """
+    # create input data
+    torch.manual_seed(0)
+    assert type(size) == tuple and len(size == 2)
+    a = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
+    b = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
+    # run kernel & pytorch reference implementation
+    c_tri = matmul(a, b)
+    c_ref = torch.matmul(a, b)
+    # compare
+    torch.testing.assert_close(c_tri, c_ref, atol=atol, rtol=rtol)
+    print("PASSED")
 
 # benchmark
 configs = [
@@ -233,4 +237,12 @@ def benchmark(M, N, K, provider):
         # 1e-12 converts flops to Teraflops
         # ms * 1e-3 converts milliseconds to seconds
     return perf(ms), perf(max_ms), perf(min_ms)
-benchmark.run(print_data=False, save_path='.')
+
+if __name__ == "__main__":
+    # always run unit-tests
+    test_matmul_kernel(size=(512, 512))
+
+    # Only run benchmark if explicitly requested
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--benchmark":
+        benchmark.run(save_path='.', print_data=False)
