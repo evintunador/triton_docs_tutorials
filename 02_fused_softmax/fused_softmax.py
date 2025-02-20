@@ -1,45 +1,56 @@
-# https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html
-# this "fused softmax" operation will be significantly faster than pytorch's native op
-#   for a particular class of matrices: those whose rows can fit in the GPU's SRAM
+"""
+this "fused softmax" operation will be significantly faster than pytorch's native op
+ for a particular class of matrices: those whose rows can fit in the GPU's SRAM
 
+see original
+https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html
+"""
 import torch
 import triton
 import triton.language as tl
-
 DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
-# first we'll look at how pytorch does it jic you need a refresher
+# first we'll look at the naive implementation jic you need a refresher
 def naive_softmax(x):
     '''
     Built for input of size (M,N)
-    we subtract the maximum element in order to avoid numerical overflows when doing .exp()
-        softmax is invariant to this shift
+    Safe softmax is when we subtract the maximum element in order to avoid numerical 
+    overflows when doing .exp(); softmax is invariant to this shift
     '''
-    # read MN elements; write M elements
-    x_max = x.max(dim=1)[0] #[0] grabs the values as opposed to the indicees
-    # read MN + M lements; write MN elements
+    # read MN elements, find their max along N, and write M elements (the maxes)
+    x_max = x.max(dim=1)[0] 
+        # pytorch actually outputs a tuple of (values, indices) so [0] grabs the values;
+        # we ignored the indices when talking about memory writes above
+    # read MN + M elements, subtraction is MN flops, and write MN elements
     z = x - x_max[:, None]
-    # read MN elements; write MN elemnts
+    # read MN elements and write MN elemnts
     numerator = torch.exp(z)
-    # read MN elements; write M elements
+        # exp is actually a lot of flops per element but we're only worried about mem ops rn
+    # read MN elements, do MN flops to find M sum values, and then write M elements
     denominator = numerator.sum(dim=1)
-    # read MN + M elements; write MN elements
+    # read MN + M elements, division is MN flops, then write MN elements
     out = numerator / denominator[:, None]
-    # in total 8MN + 4M (read 5MN + 2M elements; wrote 3MN + 2M elements)
+
+    # in total we did 8MN + 4M memory operations
+    # (read 5MN + 2M elements; wrote 3MN + 2M elements)
     return out
 
-# we'd prefer to have a custom "fused" kernel that only reads x from DRAM once and does all the necessary
-# computations on SRAM as opposed to repeatedly reading & writing to DRAM
-# that would give a ~4x speedup since 
-# (8MN + 4M)/2MN = 4 (ignoring the M term a la big O notation)
-# torch.jit.script flag actually aims to do this fusion automatically but can't pull it off quite as well
+"""
+that's a whole lot of memory operations. we'd prefer to have a custom "fused" kernel that only 
+reads x from DRAM once and does all the necessary computations on SRAM as opposed to repeatedly 
+reading & writing to DRAM. that would give a ~4x speedup since 
+(8MN + 4M)/2MN = 4 (ignoring the solo M term a la big O notation)
 
-# our fused softmax kernel works as follows:
-# each program (individual call of the kernel) loads a set of rows of the input matrix X which are
-#   strided by number of programs, softmaxes it and writes back the result to the output Y
+torch.jit.script flag and torch.compile actually aim to do this fusion automatically but can't 
+pull it off quite as well as we're about to
 
-# note an important limitation of Triton is that each block must have a power-of-two number of
-#   elements, so we need to internally "pad" each row and guard the memory operations properly
+our fused softmax kernel will work as follows:
+each program (individual call of the kernel) loads a set of rows of the input matrix X which are
+  strided by number of programs, softmaxes it and writes back the result to the output Y
+
+note an important limitation of Triton is that each block must have a power-of-two number of
+  elements, so we need to internally "pad" each row and guard the memory operations properly
+"""
 
 @triton.jit # this decorator tells Triton to compile this function into GPU code
 def _softmax_kernel(input_ptr, output_ptr, # raw memory pointers to input and output data
@@ -110,6 +121,14 @@ target = triton.runtime.driver.active.get_current_target() # TODO
 kernels = {} # this would be used for caching compiled kernels if we were running multiple operations # TODO
 
 def softmax(x):
+    '''
+    helper/wrapper function to 
+        1) allocate the output tensor and 
+        2) enque the above kernel with appropriate grid/block sizes
+    
+    This wrapper function does not connect us to pytorch's graph, meaning it does not
+    support backpropogation. That (as well as a backward pass kernel) is for a future lesson
+    '''
     n_rows, n_cols = x.shape
 
     # the block size of each loop iteration is the smallest power of 2 greater than the
@@ -188,12 +207,26 @@ def softmax(x):
     )
     return y
 
-# test our kernel on a matrix w/ an irregular number of rows & cols to verify that our padding mechanism works
-torch.manual_seed(0)
-x = torch.randn(1823, 781, device=DEVICE)
-y_triton = softmax(x)
-y_torch = torch.softmax(x, axis=1)
-assert torch.allclose(y_triton, y_torch), (y_triton, y_torch) # shouldn't print anything if successful
+def test_softmax_kernel(size, atol=1e-3, rtol=1e-3, device=DEVICE):
+    """
+    Here is where we test the wrapper function and kernel that we wrote 
+    above to ensure all our values are correct, using pytorch as the 
+    correct answer to compare against
+
+    we'll use an irregular number of rows & cols to verify that our padding mechanism works
+    """
+    # create input data
+    torch.manual_seed(0)
+    x = torch.randn(1823, 781, device=DEVICE)
+    # run kernel & pytorch reference implementation
+    z_tri = softmax(x)
+    z_ref = torch.softmax(x, axis=1)
+        # notice our implementation doesn't give a choice for what axis to softmax along.
+        # this is a common theme of custom GPU kernels; because pytorch has to write code that
+        #  is more general, it is slower than it could be
+    # compare
+    torch.testing.assert_close(z_tri, z_ref, atol=atol, rtol=rtol)
+    print("PASSED")
 
 # benchmark
 @triton.testing.perf_report(

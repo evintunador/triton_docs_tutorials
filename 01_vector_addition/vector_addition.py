@@ -5,7 +5,6 @@ https://triton-lang.org/main/getting-started/tutorials/01-vector-add.html#sphx-g
 import torch
 import triton
 import triton.language as tl
-
 DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
 # this decorator tells Triton to compile this function into GPU code
@@ -22,7 +21,7 @@ def add_kernel(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     y_ptr:          pointer to first entry of input vector of shape (n_elements)
     output_ptr:     pointer to first entry of output vector of shape (n_elements)
     n_elements:     size of our vectors
-    BLOCK_SIZE:     number of elements each kernel instance should process
+    BLOCK_SIZE:     number of elements each kernel instance should process; should be a power of 2
     
     tl.constexpr designates BLOCK_SIZE as a compile-time variable (rather than run-time), 
      meaning that every time a different value for BLOCK_SIZE is passed in you're actually 
@@ -65,14 +64,24 @@ def add_kernel(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
         # `other` refers to what value to put in place of any masked-out values; it defaults
         #  to None (so we didn't have to actually write it here) but depending on the operation
         #  it may make more sense to use a value like 0.0 (we'll see this in a later tutorial)
+        # Whenever you see a tl.load that is a memory operation which is expensive so we want to
+        #  keep track of how many memory operations we do. We count them by the total number of
+        #  entries being read/written to memory, in this case BLOCK_SIZE per kernel and 
+        #  therefore n_elements in total across all running kernels for EACH of these two lines
 
     # here we perform the operation on SRAM
     # triton has its own internal definitions of all the basic ops that you'll need
     output = x + y
-        # for the masked-out entries, None + None = None (really no operation happens at all)
+        # For the masked-out entries, None + None = None (really no operation happens at all).
+        # Similar to keeping track of memory operations, we also keep track of floating point 
+        #  operations (flops) using the shape of the blocks involved. Here this line does BLOCK_SIZE
+        #  flops for each pid, meaning n_elements flops total
+
 
     # write back to DRAM, being sure to mask in order to avoid out-of-bounds accesses
     tl.store(output_ptr + offsets, output, mask=mask)
+        # here is a memory write operation of size BLOCK_SIZE per pid and therefore n_elements 
+        # in aggregate across all pids combined
 
 def add(x: torch.Tensor, y: torch.Tensor):
     '''
