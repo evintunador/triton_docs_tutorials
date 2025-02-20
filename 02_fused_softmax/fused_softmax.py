@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
+######### Step 1 #########
 # first we'll look at the naive implementation jic you need a refresher
 def naive_softmax(x):
     '''
@@ -52,6 +53,7 @@ note an important limitation of Triton is that each block must have a power-of-t
   elements, so we need to internally "pad" each row and guard the memory operations properly
 """
 
+######### Step 4 #########
 @triton.jit # this decorator tells Triton to compile this function into GPU code
 def _softmax_kernel(input_ptr, output_ptr, # raw memory pointers to input and output data
                     input_row_stride, output_row_stride, # number of elements to skip when moving to next row
@@ -105,20 +107,27 @@ def _softmax_kernel(input_ptr, output_ptr, # raw memory pointers to input and ou
         tl.store(output_ptrs, softmax_output, mask=mask)
             # using our mask we only store back the valid values
 
-# and now we'll create a helper function that enqueues the kernel and its meta-arguments
-#   for any given input tensor. these properties will be used in the helper function to calculate
-#   how many parallel programs we can run efficiently
+######### Step 3 #########
+"""
+before we create the wrapper function that enqueues the kernel and its meta-parameters, we're going to
+ fetch the specifications of our GPU to help later when defining our meta-parameters such that they're 
+ especially well suited (fast) to the specific GPU we're using
+"""
+# fetching a dictionary full of the GPU's specifications
 properties = triton.runtime.driver.active.utils.get_device_properties(DEVICE.index)
+# each Streaming Multi-processor (SM) is like a mini-processor that can run multiple programs
 NUM_SM = properties["multiprocessor_count"] 
-    # each Streaming Multi-processor (SM) is like a mini-processor that can run multiple programs
-NUM_REGS = properties["max_num_regs"] # registers are the fastest memory on the GPU
+# registers are the fastest memory on the GPU
+NUM_REGS = properties["max_num_regs"] 
     # each SM has a limited number of registers; 
     # programs share these registers, so using too many per program limits parallelism
-TOTAL_SRAM_PER_SM = properties["max_shared_mem"] # this is total SRAM; each SM has a fixed amount of SRAM
-WARP_SIZE = properties["warpSize"]
-    # a warp is a group of threads that execute together; usually 32 on nvidia GPUs and 64 on AMD
-target = triton.runtime.driver.active.get_current_target() # TODO
-kernels = {} # this would be used for caching compiled kernels if we were running multiple operations # TODO
+# each SM has a dedicated pool of SRAM that it can access
+# since there can be multiple programs per SM, those programs share the same SRAM
+    # ^that will be very useful information later in the matmul tutorial
+TOTAL_SRAM_PER_SM = properties["max_shared_mem"] 
+# a warp is a group of threads that execute together
+# a thread can be thought of as analagous to a single CPU core, but far more limited in the operations it can do
+WARP_SIZE = properties["warpSize"]# usually 32 on nvidia GPUs and 64 on AMD
 
 def softmax(x):
     '''
@@ -129,13 +138,14 @@ def softmax(x):
     This wrapper function does not connect us to pytorch's graph, meaning it does not
     support backpropogation. That (as well as a backward pass kernel) is for a future lesson
     '''
+    # this kernel is only built to support matrices; expanding that support is simple but for a later lesson
+    assert x.ndim == 2
     n_rows, n_cols = x.shape
 
-    # the block size of each loop iteration is the smallest power of 2 greater than the
-    #   number of columns in x
+    # the block size is the smallest power of 2 greater than the number of columns in x
     BLOCK_SIZE = triton.next_power_of_2(n_cols)
 
-    # another trick we can use is to ask the compiler to use more threads per row by
+    # a trick we can use is to ask the compiler to use more threads per row by
     #   increasing the number of warps (`num_warps`) over which each row is distributed.
     # for now these settings are just a heuristic
     # you will see in the next tutorial how to auto-tune this value in a more natural way
@@ -146,35 +156,46 @@ def softmax(x):
     if BLOCK_SIZE >= 4096:
         num_warps = 16
 
-    # number of software pipelining stages, meaning how we let the GPU do multiple things at once
-    # so with 2 stages we can have one do the operation while the other is loading the next operands into memory
-    # with 4 we can have one do operations, one load next operands, one saving previous operands, 
-    #   and one pre-loading future operands
-    # Triton just needs the number of stages and it'll handle how to use them efficiently
-    # here we use a simple heuristic of "if we've got a lot of memory, use 4. otherwise use 2"
+    # Rather than executing all code within a kernel sequentially, the GPU can actually do multiple things at once.
+    # This is called the number of software pipelining stages.
+    # For example, with 2 stages we can have one do the operation while the other is loading the next operands 
+    #  from DRAM into SRAM. With 3 we can have one do current operations, one load next operands, and one saving 
+    #  previous operands.
+    # Triton just needs the number of stages and it'll handle how to use them efficiently.
+    # Here we use a simple heuristic of "if we've got a lot of memory, use 4. otherwise use 2"
     num_stages = 4 if TOTAL_SRAM_PER_SM > 200_000 else 2
 
     # allocate output
     y = torch.empty_like(x)
 
     # .warmup() pre-compiles kernel and tells us how many registers and how much shared memory it needs
-    kernel = _softmax_kernel.warmup(x, y,
-                                    x.stride(0), y.stride(0),
+    kernel = _softmax_kernel.warmup(x, y, # this warmup depends on the attributes of the input and output
+                                    x.stride(0), y.stride(0), # see below
                                     n_rows, n_cols,
                                     BLOCK_SIZE=BLOCK_SIZE,
                                     num_stages=num_stages,
-                                    num_warps=num_warps, # @triton.jit has extra arguments we didnt' define
+                                    num_warps=num_warps,
                                     grid=(1,))
+    # x.stride() for each dimension tells us how many entries in memory a pointer needs to move forward in order
+    #  to get to the next element of the tensor along the specified dimension. 
+    # For any tensor x that is "contiguous", meaning ~cleanly/simply~ defined in memory and for a shape (M, N, K) 
+    #  you can expect x.shape(0) == N*K, x.shape(1)==K, and x.shape(2)==1, or more generally 
+    #  x.shape(-Z)==math.prod(x.shape[-Z:])
+    # A tensor might be non-contiguous if, for example, it's been saved to memory using torch.view() or some similar
+    #  operation that leaves the original data in place but messes with dimensions
+
+    # here's the info that warmup process gave us
     kernel._init_handles()
     n_regs = kernel.n_regs
     sram_needed_per_program = kernel.metadata.shared 
 
+    # and here's how we use that info to setup our kernel
     # register-based occupancy
     reg_occupancy = NUM_REGS // (n_regs * WARP_SIZE * num_warps)
         # each SM has NUM_REGS registers (eg 65536)
         # each program uses
             # n_regs per register thread (eg 32)
-            # WARP_SIZE threads per warp (32 on Nvidia)
+            # WARP_SIZE threads per warp (32 on Nvidia, 64 on AMD)
             # num_warps warps per program (4, 8, or 16 in our case with the aforementioned heuristic)
         # so each program needs n_regs * WARP_SIZE * num_warps registers total
         # therefore we can fit reg_occupancy programs per SM
@@ -185,21 +206,18 @@ def softmax(x):
     programs_per_sm = min(reg_occupancy, sram_occupancy)
         # the former is the optimal allocation assuming we have more than enough SRAM
         # the latter is our limit on SRAM when splitting it equally among all SMs
-    # then given our number of SMs, we calculate ho wmany programs to run in total
+    # then given our number of SMs, we calculate how many programs to run in total
     num_programs = min(NUM_SM * programs_per_sm, n_rows)
         # ofc we have another limit since we've got no need to surpass the n_rows in the matrix
 
     # grid configuration
-    grid_config = (num_programs, 1, 1)
-        # first dimension: number of programs in x-directoin
-        # second? number of prgrams in y-direction: 
-        # etc
-        # our data parallelism is only along rows (first dimension) so we don't need 2-3D parallelism
-            # for matrix multiplication you would use (M, N, 1)
+    grid_config = (num_programs,)
+        # first dimension: number of programs in x-directoin. Each row gets its own program
+        # our data parallelism is only along rows (first dimension) so we don't need 2D or 3D parallelism
+            # for matrix multiplication you would use (M, N)
             # for 3D convolution you'd use (X, Y, Z)
-        # even if you only need 1D, it's normal to specify all three for consistency & clarity
 
-    # create a number of persistent programs
+    # And now we get to run the kernel with our heuristics-based launch grid
     kernel[grid_config](
         x, y,
         x.stride(0), y.stride(0),
@@ -207,7 +225,8 @@ def softmax(x):
     )
     return y
 
-def test_softmax_kernel(size, atol=1e-3, rtol=1e-3, device=DEVICE):
+######### Step 2 #########
+def test_softmax_kernel(size: tuple, atol=1e-3, rtol=1e-3, device=DEVICE):
     """
     Here is where we test the wrapper function and kernel that we wrote 
     above to ensure all our values are correct, using pytorch as the 
@@ -217,7 +236,8 @@ def test_softmax_kernel(size, atol=1e-3, rtol=1e-3, device=DEVICE):
     """
     # create input data
     torch.manual_seed(0)
-    x = torch.randn(1823, 781, device=DEVICE)
+    assert type(size) == tuple and len(size == 2)
+    x = torch.randn(size[0], size[1], device=DEVICE)
     # run kernel & pytorch reference implementation
     z_tri = softmax(x)
     z_ref = torch.softmax(x, axis=1)
@@ -228,7 +248,7 @@ def test_softmax_kernel(size, atol=1e-3, rtol=1e-3, device=DEVICE):
     torch.testing.assert_close(z_tri, z_ref, atol=atol, rtol=rtol)
     print("PASSED")
 
-# benchmark
+######### Step 5 #########
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['N'],
@@ -257,4 +277,11 @@ def benchmark(M, N, provider):
         # ms * 1e-3 converts milliseconds to seconds
     return gbps(ms)
 
-benchmark.run(print_data=False, save_path='.')
+if __name__ == "__main__":
+    # always run unit-tests
+    test_softmax_kernel(size=(1823, 781))
+
+    # Only run benchmark if explicitly requested
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--benchmark":
+        benchmark.run(save_path='.', print_data=False)
