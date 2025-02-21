@@ -7,6 +7,12 @@ What you'll learn:
 - Basics of Triton kernels (syntax, pointers, launch grids, DRAM vs SRAM, etc)
 - How to benchmark your Triton kernels against PyTorch
 
+Recommended order to read the code in:
+Step 1 - unit test
+Step 2 - wrapper
+Step 3 - kernel
+Step 4 - benchmark
+
 see original
 https://triton-lang.org/main/getting-started/tutorials/01-vector-add.html#sphx-glr-getting-started-tutorials-01-vector-add-py
 """

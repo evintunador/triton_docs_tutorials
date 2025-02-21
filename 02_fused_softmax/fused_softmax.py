@@ -12,6 +12,13 @@ What you'll learn:
 - Pipeline parallelism & the weird way that for-loops work within GPU kernels
 - How to choose the value of extra entries when masking
 
+Recommended order to read the code in:
+Step 1 - naive implementation
+Step 2 - unit test
+Step 3 - wrapper
+Step 4 - kernel
+Step 5 - benchmark
+
 see original
 https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html
 """

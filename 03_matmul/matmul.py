@@ -7,6 +7,12 @@ This matmul kernel can be a bit confusing but is very crucial to understand
 - Multi-dimensional pointer arithmetic
 - High precision data type accumulation
 
+Recommended order to read the code in:
+Step 1 - unit test
+Step 2 - wrapper
+Step 3 - kernel
+Step 4 - benchmark
+
 For matmul of A @ B = C of shapes (M, K) @ (K, N) = (M, N), the following
 algorithm is numerically equivalent to what our code will output, but we'll
 get to the answer in a different way
