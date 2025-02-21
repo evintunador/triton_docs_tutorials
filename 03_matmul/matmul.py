@@ -2,10 +2,10 @@
 This matmul kernel can be a bit confusing but is very crucial to understand
 
  What you'll learn:
-- Multi-dimensional pointer arithmetic
 - Automatic performance tuning
-- High precision data type accumulation
 - Program re-ordering for improved SRAM hit rate
+- Multi-dimensional pointer arithmetic
+- High precision data type accumulation
 
 For matmul of A @ B = C of shapes (M, K) @ (K, N) = (M, N), the following
 algorithm is numerically equivalent to what our code will output, but we'll
@@ -50,113 +50,216 @@ autotune_configs = [
 def _matmul_kernel(
     a_ptr, b_ptr, c_ptr, 
     M, N, K, 
-    stride_am, stride_ak, # how much to increase the ptr by when moving by 1 element along that dimension
-    stride_bk, stride_bn, # ex: increase b_ptr by stride_bk to get the element one row down (B has K rows)
-    stride_cm, stride_cn,
+    stride_a_M, stride_a_K, 
+    stride_b_K, stride_b_N, 
+    stride_c_M, stride_c_N, 
     # meta-parameters
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-    ACTIVATION: tl.constexpr
+    GROUP_SIZE: tl.constexpr, 
 ):
-    # first we map program ids (pids) to the block of C it should compute
-    # this is done in grouped ordering to promote SRAM data reuse (pids within a group share data along k dimension)
-    # for a visual see https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html
-    # Each GPU has multiple Streaming Multiprocessors (SMs), and each SM has its own SRAM.
-    # Thread blocks (represented by PIDs) that run on the same SM can share SRAM, but blocks on different SMs cannot.
-    # Triton is smart enough to reuse data already loaded onto the same SRAM than load on a duplicate copy.
-    # The grouping strategy below tries to arrange the computation so that blocks that need the same data
-    # are more likely to run on the same SM, allowing them to share data through SRAM.
-    # we start with a 1D launch grid that we will turn into a 2D grid WITH A COMPLICATED ORDERING
-    pid = tl.program_id(axis=0) 
-    num_pid_along_m = tl.cdiv(M, BLOCK_SIZE_M) # the number of blocks along M dimension
-    num_pid_along_n = tl.cdiv(N, BLOCK_SIZE_N) # the number of blocks along N dimension
-    num_pid_in_group = GROUP_SIZE * num_pid_along_n 
-        # so for the GROUP_SIZE number of rows we'll be using, we need to grab a matching set of columns, specifically
-        # we'll grab GROUP_SIZE number of columns each with num_pid_along_n number of blocks in them.
-        # meaning these are groups OF BLOCKS
-    group_id = pid // num_pid_in_group # figurinig out which group we are
-    first_pid_in_group_along_m = group_id * GROUP_SIZE # tells us which row to start at for this group
-    group_size_adj = min(num_pid_along_m - first_pid_in_group_along_m, GROUP_SIZE) # usually equal to GROUP_SIZE.
-        # alternative case happens when we're at edge of tensor and tensor dimensions don't cleanly divde into GROUP_SIZE
-        # ^ is this true? idk
-
-    # this is the bulk of the actual mapping from 1D to 2D - the weird pattern that is the reason we didn't use a 2D grid
-    # (pid % num_pid_in_group) puts the current program id into the context of a group
-    pid_m = first_pid_in_group_along_m + ((pid % num_pid_in_group) % group_size_adj)
-        # (first_pid_in_group_along_m +) shifts the pid into the correct group
-        # (% group_size_adj) removes the column component to get us onto the correct row
-    pid_n = (pid % num_pid_in_group) // group_size_adj
-        # (// group_size_adj) removes the row component to get us onto the correct column
     """
-    as an example, pick any PID from the first matrix and follow it through the above calculations to the second matrix
-    M=N=K=8
-    BLOCK_SIZE_M=BLOCK_SIZE_N=BLOCK_SIZE_K=2
-    GROUP_SIZE=2
-    # naive 1D placement of pid's
-    [' 0', ' 1', ' 2', ' 3']
-    [' 4', ' 5', ' 6', ' 7']
-    [' 8', ' 9', '10', '11']
-    [' 12', '13', '14', '15']
-    # final 2D pid access grid
-    [' 0', ' 2', ' 4', ' 6']
-    [' 1', ' 3', ' 5', ' 7']
-    [' 8', '10', '12', '14']
-    [' 9', '11', '13', '15'] 
-    note that the pid number is the order in which these get loaded into an SM and onto SRAM, meaning that
-    if a given SM can handle 4 pid's, then 0, 1, 2, and 3 will all get loaded onto the same one. Since 0 and 1
-    make tl.load() calls to the same columns, first 0 will load it and then when 1 goes to load it Triton will
-    say "oh, it's already here, just use that" and same for the column that 2 & 3 share as well as the row that
-    0 & 2 share and the row that 1 & 3 share. It's not guaranteed that the SM handles an ideal number of pid's 
-    for your matrix shape and the way you loaded it in, but that's why we did autotuning earlier, to find 
-    ideal block and group sizes given the properties of our hardware, such as the number of pid's an SM can handle.
+    First we need to map each program id to the block of C it will compute. 
+    Let's look at an example where
+    M = N = K = 8,
+    BLOCK_SIZE_M = BLOCK_SIZE_K = BLOCK_SIZE_N = 2
+    A naive implementation might do something like
+    [0,   1,  2,  3]
+    [4,   5,  6,  7]
+    [8,   9, 10, 11]
+    [12, 13, 14, 15]
+    where each of those PIDs corresponds to a 2x2 block of C (which is of size 8x8). 
+    What parts of A and B do we need in order to compone one of them, say 0? 
+    Let's look at how matmul works, where x's will denote the blocks in A and B that we need to use to create 
+    the block of C corresponding to PID=0
+        A           @       B           =       C
+    [x, x, x, x]        [x, _, _, _]        [0, _, _, _]
+    [_, _, _, _]        [x, _, _, _]        [_, _, _, _]
+    [_, _, _, _]        [x, _, _, _]        [_, _, _, _]
+    [_, _, _, _]        [x, _, _, _]        [_, _, _, _]
+    So in order to create the 2x2 block of C that corresponds to PID=0, we need four 2x2 blocks from the top rows 
+    of A and four 2x2 blocks from the first columns of B. 
+    Note that rather than loading all 8 blocks into SRAM at the same time, we can iterate over the columns/rows 
+    of A/B (respectively), doing a kind of mini matmul between two corresponding blocks and adding them together as we go.
+        A           @       B
+    [--------->]        [ | , _, _, _]
+    [_, _, _, _]        [ | , _, _, _]
+    [_, _, _, _]        [ | , _, _, _]
+    [_, _, _, _]        [\|/, _, _, _]
+    If this fact isn't intuitive, check out `./block_wise_matmul.png`
+    Great, if we were to implement this algorithm as described it'd work. 
+    However, it would not be nearly as fast as PyTorch's method, which implements something far more clever. 
+    To see why, we need to think about our SRAM usage. 
+    Notice that PIDs 0 through 3 all utilize the same row of blocks of A, and remember that we can have 
+    multiple programs per SM all sharing the same pool of SRAM. 
+    That means that rather than each of them loading that same row of blocks of A separately, leading to a bunch of 
+    duplicates, once one PID loads a block of A along that row then the other 3 could just re-use it! 
+    
+    Luckily we do not have to ~explicitly~ tell Triton to do this; every time a PID runs tl.load() it'll first automatically
+    check to see if that data already exists in SRAM thanks to some other PID sharing the same SM that got to it first.
+    While we don't have to explicitly tell Triton to do this, we should think very carefully about helping Triton take 
+    best advantage of this ability by manipulating the orderin gof the PIDs. 
+    Importantly, PIDs get assigned to SMs IN ORDER!! 
+    To re-state, the order of your PIDs determines which blocks of C get to share SRAM!!
+    Let's look again at PIDs 0 through 3, specifically at which blocks of A and B they need to load:
+    PID = 0
+    [x, x, x, x]        [x, _, _, _]
+    [_, _, _, _]        [x, _, _, _]
+    [_, _, _, _]        [x, _, _, _]
+    [_, _, _, _]        [x, _, _, _]
+    PID = 1
+    [x, x, x, x]        [_, x, _, _]
+    [_, _, _, _]        [_, x, _, _]
+    [_, _, _, _]        [_, x, _, _]
+    [_, _, _, _]        [_, x, _, _]
+    PID = 2
+    [x, x, x, x]        [_, _, x, _]
+    [_, _, _, _]        [_, _, x, _]
+    [_, _, _, _]        [_, _, x, _]
+    [_, _, _, _]        [_, _, x, _]
+    PID = 3
+    [x, x, x, x]        [_, _, _, x]
+    [_, _, _, _]        [_, _, _, x]
+    [_, _, _, _]        [_, _, _, x]
+    [_, _, _, _]        [_, _, _, x]
+    Notice that although they can all share the first row of blocks of A and therefore avoid loading the other three
+    rows of blocks, they actually end up loading every single column of blocks of B. 
+    Can we do better? 
+    Can we get the same number of PIDs (and therefore the same number of blocks of C) to be constructed using fewer 
+    total blocks of A and B? 
+    Currently, with this method that we'll call "row-major ordering", we're loading:
+        (1 row of blocks of A) + (4 columns of blocks of B) = 5 total rows/cols of blocks loaded to SRAM
+    
+    Well what if instead of putting PIDs 0 through 3 onto the same SM, we could put  PIDs 0, 1, 4, and 5 on the same SM?
+    Taking a look at what PIDs 4 and 5 need to load:
+    PID = 4
+    [_, _, _, _]        [x, _, _, _]
+    [x, x, x, x]        [x, _, _, _]
+    [_, _, _, _]        [x, _, _, _]
+    [_, _, _, _]        [x, _, _, _]
+    PID = 5
+    [_, _, _, _]        [_, x, _, _]
+    [x, x, x, x]        [_, x, _, _]
+    [_, _, _, _]        [_, x, _, _]
+    [_, _, _, _]        [_, x, _, _]
+    Now suddenly with this hypoethetical new setup, we would only need to load 
+        (2 rows of blocks of A) + (2 columns of blocks of B) = 4 total rows/cols of blocks loaded to SRAM
+    And yet we're still getting the same number of blocks of C as output! 
+    This strategy is called "group-major ordering".
+    The effect doesn't seem too huge with this tiny example, but as the number of blocks increases it becomes increasingly 
+    effective at saving us from having to do so many duplicate loads of blocks of A and B onto different SMs. 
+    
+    However, remember that Triton loads blocks into SMs based on the order of PIDs, meaning that even though we'd love it
+    if PIDs 0, 1, 4, and 5 all shared the same SRAM, in reality PIDs 3 and 4 are likely going to get in the way of 
+    that happening. 
+    So how do we ensure the blocks of C corresponding to PIDs 4 and 5 get loaded onto the same SM as 0 and 1? 
+    We'll actually have to re-order our PIDs, meaning re-assign them to different blocks of C. 
+    Remember our input launch grid is 1-dimensional (like all previous launch grids we've seen), meaning it 
+    was defined by a tuple with only one entry. 
+    It's our job once inside the kernel to take that 1D list of PIDs and morph them into the shape we desire. 
+    I'll reiterate, the key thing to note here is that PIDs that are numerically closer together are more likely to 
+    end up on the same SM, meaning that even though we said earlier it'd be great if 0, 1, 4, and 5 all
+    shared SRAM, in reality according to our earlier "naive" launch grid, 0, 1, 2, and 3 are going to be grouped together.
+    So what we need to do instead is move 2 and 3 such that they correspond to the blocks of C that we previously had
+    assigned to 4 and 5. 
+    Instead of explaining, check out this new visual ordering:
+    [0,  2,  4,  6]
+    [1,  3,  5,  7]
+    [8, 10, 12, 14]
+    [9, 11, 13, 15] 
+    Now, 0 through 3 correspond to group-major ordering! Notice in this example we can visualize it as splitting our
+    PIDs into "groups" demarcated by the dashed lines
+    [0,  2, |  4,  6]
+    [1,  3, |  5,  7]
+    --------|--------
+    [8, 10, | 12, 14]
+    [9, 11, | 13, 15] 
+    The size of these groups is defined by our "GROUP_SIZE" meta-parameter.
+    To get this re-ordering of our PIDs we'll need to do some technically simple but surprisingly difficult to keep 
+    track of math. 
+    """
+    # we start with a 1D launch grid that we will turn into a 2D grid with a complicated "group-wise" ordering
+    PID = tl.program_id(axis=0) 
+    # defining the size of groups
+    num_PID_along_M = tl.cdiv(M, BLOCK_SIZE_M) # the number of blocks along M dimension
+    num_PID_along_N = tl.cdiv(N, BLOCK_SIZE_N) # the number of blocks along N dimension
+    num_PID_in_group = GROUP_SIZE * num_PID_along_N
+    # figurinig out which group this PID is in
+    group_id = PID // num_PID_in_group 
+    # tells us which row to start at for this group
+    first_PID_in_group_along_M = group_id * GROUP_SIZE 
+    # this is usually equal to GROUP_SIZE; the alternative case happens when we're at edge of the tensor and 
+    #  its dimensions don't cleanly divde into GROUP_SIZE # TODO is this true?
+    group_size_adj = min(num_PID_along_M - first_PID_in_group_along_M, GROUP_SIZE) 
+    # this is the bulk of the actual mapping of PIDs to group-major ordering
+    PID_M = first_PID_in_group_along_M + ((PID % num_PID_in_group) % group_size_adj)
+        # (PID % num_PID_in_group) puts the current program id into the context of a group
+        # (first_PID_in_group_along_m + ...) shifts the PID into the correct group
+        # (... % group_size_adj) removes the column component to get us onto the correct row
+    PID_N = (PID % num_PID_in_group) // group_size_adj
+        # (... // group_size_adj) removes the row component to get us onto the correct column
+    
+    # Now that the PID nightmare is done we can move onto the kernel code you're more used to seeing.
+
+    # Let's create pointer vectors for the first group of blocks of the input matrices
+    offsets_M = PID_M * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offsets_N = PID_N * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offsets_K = tl.arange(0, BLOCK_SIZE_K)
+    # in previous lessons the blocks we loaded into SRAM were vectors; here they are matrices
+    a_offsets = offsets_M[:, None] * stride_a_M + offsets_K[None, :] * stride_a_K
+    b_offsets = offsets_K[:, None] * stride_b_K + offsets_N[None, :] * stride_b_N
+    """
+    [:, None] turns [m1,m2,m3] into [[m1],[m2],[m3]] 
+    [None, :] turns [n1,n2,n3] into [[n1,n2,n3]]
+    combining them gives the matrix
+    [[m1n1, m1n2, m1n3],
+     [m2n1, m2n2, m2n3],
+     [m3n1, m3n2, m3n3]] 
     """
 
-    # now we'll create pointer vectors for the first group of blocks of the input matrices
-    # a_ptrs is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
-    offsets_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) #% M <- not sure why that was originally here, edge case?
-    # b_ptrs is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
-    offsets_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) #% N <- not sure why that was originally here, edge case?
-    offsets_k = tl.arange(0, BLOCK_SIZE_K) # this is used to setup k dimension of initial a & b offsets
-    # now we convert our group/block/pid based indices to their actual tensor mappings using first-entry pointers & stride length
-    a_ptrs = a_ptr + (offsets_am.expand_dims(1) * stride_am + offsets_k.expand_dims(0) * stride_ak)
-    b_ptrs = b_ptr + (offsets_k.expand_dims(1) * stride_bk + offsets_bn.expand_dims(0) * stride_bn)
+    # inputs tensors are fp16 but we accumulate into a block of fp32 values for higher accuracy (we'll revert later)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32) # the full C is shape (M, N)
+        # for a demonstration of why accumulation works, check out `./block_wise_matmul.png`
         
-    # iterate to compute a block of the C matrix
-    # inputs are fp16. we accumulate into a block of fp32 values for higher accuracy
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)): # iterate from 0 to the number of blocks along K dimension
-
+    # we'll iterate along the K dimension of both A and B to compute a single block of the C matrix
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # out-of-bounds entries (along K) need to be masked out
-        mask = offsets_k < K - k * BLOCK_SIZE_K
+        mask = offsets_K < K - k * BLOCK_SIZE_K
             # k * BLOCK_SIZE_K is the current starting index of offsets_k.
-            # so this only really activates when K is within BLOCK_SIZE_K entries from the starting index.
-            # when that does happen, suddenly how K - k * BLOCK_SIZE_K gives us a number of entries <= BLOCK_SIZE_K
-            # meaning anything in offsets_k above this value needs to be masked out.
-            # so this gets triggered on the last iteration of the loop, and only when K is not a multiple of BLOCK_SIZE_K
+            # so this only really activates when k is within BLOCK_SIZE_K entries from K
+            # meaning this gets triggered on the last iteration of the loop, and only if K is not a multiple of BLOCK_SIZE_K
         
         # Now we load blocks of A and B matrices. If multiple blocks in a group are on the same SM, 
         # they can share these loaded values, which reduces the number of expensive loads from DRAM
-        a = tl.load(a_ptrs, mask=mask.expand_dims(0), other=0.0)
-        b = tl.load(b_ptrs, mask=mask.expand_dims(1), other=0.0)
-            # fill in any masked-out parts with 0.0
-            # 0.0's don't have any effect on the summation in the next step
+        a = tl.load(a_ptr + a_offsets, mask=mask[None, :], other=0.0) # shape (BLOCK_SIZE_M, BLOCK_SIZE_K)
+        b = tl.load(b_ptr + a_offsets, mask=mask[:, None], other=0.0) # shape (BLOCK_SIZE_K, BLOCK_SIZE_N)
+            # fill in any masked-out parts with 0.0's since they don't have any effect on the summation in the next step
 
         # we accumulate along the K dimension
-        accumulator = tl.dot(a, b, accumulator)
-            # triton is weird with operation notation; this is actually a tiny matmul not just a dot product
+        accumulator = tl.dot(a, b, acc=accumulator)
+            # triton is weird with operation notation; this is actually a tiny matmul not a dot product
+            #   shape (BLOCK_SIZE_M, BLOCK_SIZE_K) @ (BLOCK_SIZE_K, BLOCK_SIZE_N) = (BLOCK_SIZE_M, BLOCK_SIZE_N)
+            # `acc` tells Triton to write the output of the matmul directly to accumulator, which is more efficient than
+            #   accumulator += tl.dot(a, b)
 
-        # advance the ptrs to the next K block
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        # advance the pointers to the next block along K
+        a_offsets += BLOCK_SIZE_K * stride_a_K
+        b_offsets += BLOCK_SIZE_K * stride_b_K
+        """
+        A visual representation of the accumulation movement for PID=0
+            A           @       B
+        [--------->]        [ | , _, _, _]
+        [_, _, _, _]        [ | , _, _, _]
+        [_, _, _, _]        [ | , _, _, _]
+        [_, _, _, _]        [\|/, _, _, _]
+        """
 
+    # and now we reset the data type to the expected output
     accumulator = accumulator.to(tl.float16)
 
     # write back the block of the output matrix C with masks
-    offsets_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offsets_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offsets_cm.expand_dims(1) + stride_cn * offsets_cn.expand_dims(0)
-    c_mask = (offsets_cm.expand_dims(1) < M) & (offsets_cn.expand_dims(0) < N)
-    tl.store(c_ptrs, accumulator, mask=c_mask)
+    c_offsets = stride_c_M * offsets_M[:, None] + stride_c_N * offsets_N[None, :]
+    c_mask = (offsets_M[:, None] < M) & (offsets_N[None, :] < N) # notice the 2D mask
+    tl.store(c_ptr + c_offsets, accumulator, mask=c_mask) # shape (BLOCK_SIZE_M, BLOCK_SIZE_N)
 
 
 ######### Step 2 #########
@@ -173,8 +276,12 @@ def matmul(a, b):
     # allocates output
     c = torch.empty((M, N), device=a.device, dtype=torch.float16)
     
-    # 1D launch kernel where each block gets its own program; this is explained inside the kernel
-    grid = lambda meta: (triton.cdiv(m, meta['BLOCK_SIZE_M']) * triton.cdiv(n, meta['BLOCK_SIZE_N']), )
+    # cdiv(x, y) = (x + (y - 1)) // y
+    # A naive (slow) launch grid might try to separate our axes of parallelizatio into 2 dimensions, one
+    #  for cdiv(M, BLOCK_SIZE_M) and the other for cdiv(N, BLOCK_SIZE_N)
+    # Here instead we use a 1D launch kernel defined by cdiv(M, BLOCK_SIZE_M) * cdiv(N, BLOCK_SIZE_N)
+    # The reasoning behind this is explained inside the kernel
+    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']) * triton.cdiv(N, meta['BLOCK_SIZE_N']), )
     _matmul_kernel[grid](
         a, b, c,
         M, N, K,
@@ -208,39 +315,39 @@ def test_matmul_kernel(size: tuple, atol=1e-2, rtol=1e-1, device=DEVICE): # TODO
     torch.testing.assert_close(c_tri, c_ref, atol=atol, rtol=rtol)
     print("PASSED")
 
-# benchmark
+######### Step 4 #########
 configs = [
     triton.testing.Benchmark(
-        x_names = ["M", "N", "K"],
+        x_names = ["M", "N", "K"], # we can increase multiple dimensions simultaneously while benchmarking
         x_vals = [128 * i for i in range(2, 33)],
         line_arg = "provider", 
-        line_vals = ["cublas", "triton"],
-        line_names = ["cuBLAS", "Triton"],
+        line_vals = ["torch", "triton"],
+        line_names = ["PyTorch", "Triton"],
         styles = [("green", "-"), ("blue", "-")],
         ylabel = "TFLOPS", 
         plot_name = "matmul-performance",
-        args={}, # values for funciton arguments not in x_names and y_names; need it even if not using
+        args={},
     )
 ]
 @triton.testing.perf_report(configs)
 def benchmark(M, N, K, provider):
     a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
     b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
-    quantiles = [0.5, 0.2, 0.8]
-    if provider == 'cublas':
+    quantiles = [0.5, 0.05, 0.95]
+    if provider == 'torch':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles)
     if provider == 'triton':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(a, b), quantiles=quantiles)
-    perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
-        # 2 = number of memory operations (1 read + 1 write)
-        # M * N * K = number of elements
+    perf = lambda ms: 3 * M * N * K * 1e-12 / (ms * 1e-3)
+        # 3 = number of memory operations (2 read + 1 write)
+        # M * N * K = number of elements per memory op
         # 1e-12 converts flops to Teraflops
-        # ms * 1e-3 converts milliseconds to seconds
+        # 1e-3 converts milliseconds to seconds
     return perf(ms), perf(max_ms), perf(min_ms)
 
 if __name__ == "__main__":
     # always run unit-tests
-    test_matmul_kernel(size=(512, 512))
+    test_matmul_kernel(size=(1024, 1024))
 
     # Only run benchmark if explicitly requested
     import sys
