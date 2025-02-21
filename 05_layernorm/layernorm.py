@@ -1,4 +1,15 @@
 """
+In this lesson on LayerNorm we'll finally connect our kernels to PyTorch's backpropogation graph. Keep in mind
+this kernel is fast but it only works for normalizing vectors that fit within SRAM, so we've done a trade-off
+of better speed for worse generalize-abililty
+
+What you'll learn:
+- Writing a backward pass kernel
+- Using torch.nn.functional to connect to PyTorch's backpropogation graph
+- Locks and atomic operations
+- How to use sequential kernels with intermediate tensors to complete a calculation 
+    more efficiently than one kernel alone could
+
 see original
 https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html#sphx-glr-getting-started-tutorials-05-layer-norm-py
 """
@@ -8,8 +19,9 @@ import triton.language as tl
 
 DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
+######### Step 3 #########
 @triton.jit
-def _layer_norm_fwd_fused(
+def _layernorm_forward(
     x_ptr, # pointer to first entry of the input
     y_ptr, # pointer to first entry of the output
     w_ptr, # pointer to first entry of the weights
@@ -60,8 +72,9 @@ def _layer_norm_fwd_fused(
         # Write output
         tl.store(y_ptr + cols, y, mask=mask)
 
+######### Step 4 #########
 @triton.jit
-def _layer_norm_backward_dx_fused(DX_ptr,  # pointer to the input gradient dL/dx where L is loss
+def _layernorm_backward_dLdx(DX_ptr,  # pointer to the input gradient dL/dx where L is loss
                                 DY_ptr,  # pointer to the output gradient dL/dy
                                 DW_ptr,  # pointer to the partial sum of weights gradient dL/dw
                                 DB_ptr,  # pointer to the partial sum of biases gradient dL/db
@@ -148,9 +161,8 @@ def _layer_norm_backward_dx_fused(DX_ptr,  # pointer to the input gradient dL/dx
     tl.atomic_xchg(Lock_ptr, 0) # so we set the value equal to 0
     # whichever pid gets to the 0 value first with its .atomic_cas() will get to go next
 
-
 @triton.jit
-def _layer_norm_backward_dwdb(PARTIAL_DW_ptr,  # pointer to the partial sum of weights gradient
+def _layernorm_backward_dLdw_dLdb(PARTIAL_DW_ptr,  # pointer to the partial sum of weights gradient
                          PARTIAL_DB_ptr,  # pointer to the partial sum of biases gradient
                          FINAL_DW_ptr,  # pointer to the weights gradient
                          FINAL_DB_ptr,  # pointer to the biases gradient
@@ -181,157 +193,169 @@ def _layer_norm_backward_dwdb(PARTIAL_DW_ptr,  # pointer to the partial sum of w
 
 
 
-
+######### Step 2 #########
 class LayerNorm(torch.autograd.Function): 
     """
-    We can implement our own custom autograd Functions by subclassing
-    torch.autograd.Function and implementing the forward and backward passes
-    which operate on Tensors.
+    We can implement our own custom functions that play nice with PyTorch's autograd graph
+    by subclassing torch.autograd.Function and implementing the forward and backward passes
+    with static methods forward() and backward(). 
     """
 
     @staticmethod
     def forward(
         ctx, # ctx is an object we use to store info that'll be used later in the backward pass
-            # it doesn't actually get inputted to .forward(), rather it's handled by parent torch.autograd.Function
-        x, # the input, duh
+            # it doesn't actually get inputted when using .forward(), rather it's handled by the parent class
+        x, # the input; however many dimensions will be turned into a matrix of shape (M, N)
         normalized_shape, # this never gets used, but putting it here keeps arguments consistent with pytorch which does use it
-        weight, # so LayerNorm is in fact a function rather than a module 
-        bias, # because it's requiring us to pass in weight & bias parameters instead of stroing them
-        eps # very small value (eg 1e-6) to prevent division by zero in the std calculation
+        weight, # so this LayerNorm class is in fact acting as a function rather than a module since w&b are stored elsewhere
+        bias, # weight and bias both of shape (x.shape[-1])
+        eps # very small value (eg 1e-6) to prevent division by zero in the reciprocal standard deviation calculation
     ):
-        """
-        In the forward pass we receive a Tensor containing the input and return
-        a Tensor containing the output. ctx is a context object that can be used
-        to stash information for backward computation. You can cache arbitrary
-        objects for use in the backward pass using the ctx.save_for_backward method.
-        """
         # reshape to 2D tensor and grab said shapes
         M, N = x.reshape(-1, x.shape[-1]).shape
-            # because we use stride to move through memory we only need N as opposed to the dimensions that make it up
         # allocate intermediary tensors and final output
         mean = torch.empty((M, ), dtype=torch.float32, device=x.device)
         rstd = torch.empty((M, ), dtype=torch.float32, device=x.device)
         y = torch.empty_like(x)
-        # if there's less than 64KB per feature: enqueue fused kernel
-        MAX_FUSED_SIZE = 65536 // x.element_size() # .element_size() returns number of bytes per a single entry
+
+        # if there's less than 64KB per feature then we can use our fused kernel
+        MAX_FUSED_SIZE = 65536 // x.element_size() 
+            # .element_size() returns number of bytes per a single entry
+                # fp32 element_size = 4, fp16 element_size = 2, fp8 element_size = 1
             # so this is used to calculate how many elements can fit within a 64KB block of memory
-            # fp32 element_size = 4, fp16 element_size = 2, fp8 element_size = 1
+            # 64KB is a heuristic for the smallest possible SRAM size our GPU is likely to have; it'd be beter
+            #  if we got our GPU's actual SRAM size and used that (look back at lesson 2 for how to do this)
         BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
-            # either define block_size by 
+            # we'll either define block_size by 
             # - the maximum amount of entries that a 64kb block of memory can hold or
             # - the smallest size that can hold the dimension N
         if N > BLOCK_SIZE: # so if we used MAX_FUSED_SIZE
             raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-            # in order to support feature_dim bigger than this we'd prolly have to parallelize within feature_dim given common SRAM sizes
+            # in order to support feature_dim bigger than SRAM size we'd have to parallelize within feature_dim
+
         # heuristics for number of warps
         num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
-        # enqueue kernel
-        _layer_norm_fwd_fused[(M, )](  # grid parallelizes across all non-embedding dimensions (which were flattened into M earlier)
-            x, y, # input and pre-allocated output
-            weight, bias, # pre-determined parameters
+        
+        _layernorm_forward[(M, )](  # grid parallelizes using a separate program for each non-embedding dimension entry
+            x, y, weight, bias,
             mean, rstd,  # pre-allocated intermediary useful tensors
-            x.stride(0), # number of memory items needed to move forward to hit the next row of x (should be = N, no?)
-            N, # model embedding dimension; will be used for hardware mask
-            eps,  # small number to prevent division by 0 in std calculation
+            x.stride(0), # number of memory items needed to move forward to hit the next row of x (should be = N if x is contiguous)
+            N, # model embedding dimension will be used for hardware mask
+            eps,  # small number to prevent division by 0 in reciprocal standard deviation calculation
             # meta-paramaters
             BLOCK_SIZE=BLOCK_SIZE, num_warps=num_warps, 
-            num_ctas=1 # number of blocks in a block cluster; newer GPU architectures can use it, but older should set to 1
-                # honestly we don't need to put it here since it defaults to 1
-            ) 
-        # now we save a bunch of intermediary tensors and values that'll be useful for the backward pass later
+        ) 
+
+        # ctx is an object that can be used to stash information that's useful for the backward pass computation
+        # You can cache arbitrary objects using the ctx.save_for_backward method
         ctx.save_for_backward(x, weight, bias, mean, rstd)
-        # save_for_backward is for tensors, whereas meta-parameters get saved as individual entries in the object
+        # save_for_backward is mostly for tensors, whereas meta-parameters get saved as individual entries in the object
         ctx.BLOCK_SIZE = BLOCK_SIZE
         ctx.num_warps = num_warps
         ctx.eps = eps
+
         # and finally return our output
         return y
 
     @staticmethod
     def backward(
-        ctx, # object holding tensors defined in the forward pass that we saved for use here
-            # when calling .backward() we don't actually input ctx; rather it is handled by torch.autograd.Function
-        dy # partial derivative of the loss with respect to y, the output of this function's forward method
+        ctx, # when calling .backward() we don't actually input ctx; rather it is handled by torch.autograd.Function
+        dLdy # partial derivative of the loss with respect to y
     ):
         """
-        In the backward pass we receive a Tensor containing the gradient of the loss
-        with respect to the output, and we need to compute the gradient of the loss
-        with respect to the input.
+        In the backward pass we receive a Tensor containing the gradient of the loss with respect to the output, and 
+        we need to compute the gradient of the loss with respect to the input(s).
         """
-        # fetcing the original input, weights, biases, means, and reciprocal standard deviations
+        # fetcing the original inputs, intermediary tensors, and meta-parameters
         x, w, b, mean, rstd = ctx.saved_tensors
-        # and our tensor shape
         M, N = x.reshape(-1, x.shape[-1]).shape
-            # we only care about the final dimension since parallelizing across the others involves treating them all the same
-        # heuristics for amount of parallel reduction stream for DW/DB
+
+        # allocate gradients of original inputs
+        dLdw = torch.empty((N, ), dtype=w.dtype, device=w.device) # the non-'_' versions are final gradients
+        dLdb = torch.empty((N, ), dtype=w.dtype, device=w.device)
+        dLdx = torch.empty_like(dLdy)
+
+        # heuristics for amount of parallel reduction stream for dLdw & dLdB; explained a bit below but mostly in the kernel
         GROUP_SIZE = 64
         if N <= 8192: GROUP_SIZE = 96
         if N <= 4096: GROUP_SIZE = 128
         if N <= 1024: GROUP_SIZE = 256
-        # allocate output
+
+        # Rather than computing all three gradients immediately in one kernel, we're actually going to call two kernels.
+        # The first will compute dLdx and intermediary steps on the way to dLdw and dLdb; we'll call these _dLdw and _dLdb
+        _dLdw = torch.zeros((GROUP_SIZE, N), dtype=x.dtype, device=w.device)
+        _dLdb = torch.zeros((GROUP_SIZE, N), dtype=x.dtype, device=w.device)
+
+        # When multiple programs want to edit the same entries in a tensor stored in DRAM, we need a way to prevent them from
+        #  doing so out of order and from overwriting each other's work. For that we can use a lock, which is another tensor 
+        #  with the job of keeping track of which entries are currently being worked on by a different program and which are
+        #  free to be edited
         locks = torch.zeros(2 * GROUP_SIZE, dtype=torch.int32, device=w.device)
             # the first GROUP_SIZE entries in our locks tensor will be used to determine whether a lock is on or off
-            # the second will keep track of whether the lock has been used before, since we treat the first use differently
-        _dw = torch.zeros((GROUP_SIZE, N), dtype=x.dtype, device=w.device) # the '_d' versions are intermediaries used for accumulation
-        _db = torch.zeros((GROUP_SIZE, N), dtype=x.dtype, device=w.device)
-        dw = torch.empty((N, ), dtype=w.dtype, device=w.device) # the non-'_' versions are final gradients
-        db = torch.empty((N, ), dtype=w.dtype, device=w.device)
-        dx = torch.empty_like(dy)
-        # enqueue kernel that uses forward pass heuristics to calculate both dx and the partial sums for dw and db
-        _layer_norm_backward_dx_fused[(M, )](  # parallelize across rows
-            dx, dy, _dw, _db, x, w, mean, rstd, locks,  # all of our tensors that'll get turned into pointers
-            x.stride(0), N,  # our integer values (determined at run-time)
-            BLOCK_SIZE_N=ctx.BLOCK_SIZE,  # our meta-parameters (determined at compile-time)
-            GROUP_SIZE=GROUP_SIZE, 
-            num_warps=ctx.num_warps) # triton handles implementation of num_warps for us so no need to think about it
-        # now for a seperate call to the other kernel who's job is to accumulate the partial sums for dw and db.
-        # we do this in a separate kernel since this final set of operations requires fewer pids 
-        #  (potentially as few as 1 if BLOCK_SIZE_N > N), as opposed to the previous kernel which called M pids
+                # (AKA whether the important tensor is occupied or available)
+            # the second will keep track of whether the lock has been used before, since in the kernel we will need to 
+            #  treat the first use differently from all successive uses
+        
+        # enqueue kernel that uses forward pass heuristics to calculate both dLdx and the partial sums of dLdw and dLdb
+        _layernorm_backward_dLdx[(M, )](  # parallelize across rows
+            dLdx, dLdy, _dLdw, _dLdb, x, w, mean, rstd, locks,  # all of our tensors that'll get turned into pointers
+            x.stride(0), N,  # dynamic run-time variables
+            BLOCK_SIZE_N = ctx.BLOCK_SIZE, GROUP_SIZE = GROUP_SIZE, num_warps = ctx.num_warps) # static compile-time variables
+        
+        # Now we'll do a seperate call to the second kernel, who's job is to accumulate _dLdw into dLdw and _dLdb into dLdb.
+        # We do this in a separate kernel since this final set of operations requires 
+        #  1) fewer pids (potentially as few as 1 if BLOCK_SIZE_N > N), as opposed to the previous kernel which called M pids
+        #  and 2) _dLdw and _dLdb to be completed before it can begin
         grid = lambda meta: [triton.cdiv(N, meta['BLOCK_SIZE_N'])] # parallelize within rows
-        _layer_norm_backward_dwdb[grid](
-            _dw, _db, dw, db, # intermediary and final tensors
+        _layernorm_backward_dLdw_dLdb[grid](
+            _dLdw, _dLdb, dLdw, dLdb, # intermediary and final tensors
             min(GROUP_SIZE, M), N,  # run-time integer values
             BLOCK_SIZE_M=32, BLOCK_SIZE_N=128, # heuristically chosen compile-time values
-            num_ctas=1) # again pls ignore num_ctas; it defaults to 1 so there's no real reason to define it here
-        # it's not necessary for our uses since we write to tensors in-place, but it's a PyTorch convention to always return these.
-        return dx, None, dw, db, None 
-            # the None values correspond to the inputs of the forward pass that don't need gradients (order matters!)
+        )
+        
+        # pytorch expects .backward() to return a value for every single input into .forward() in order so that it can keep
+        #  track for the backpropogation graph
+        return dLdx, None, dLdw, dLdb, None 
+            # the None values correspond to the inputs of .forward() that don't need gradients (order matters!)
 
+# this line just creates a reference to the apply function of LayerNorm rather than having it act like an object
+layernorm = LayerNorm.apply 
 
-# just creates a reference to the apply function of LayerNorm
-layer_norm = LayerNorm.apply 
-
-
-def test_layer_norm(M, N, dtype, eps=1e-5, device=DEVICE):
+######### Step 1 #########
+def test_layernorm_kernel(M, N, dtype, eps=1e-5, device=DEVICE):
     # create data
-    x_shape = (M, N)
-    w_shape = (x_shape[-1], )
-    weight = torch.rand(w_shape, dtype=dtype, device=device, requires_grad=True)
-    bias = torch.rand(w_shape, dtype=dtype, device=device, requires_grad=True)
-    x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device=device)
+    x = -2.3 + 0.5 * torch.randn((M, N), dtype=dtype, device=device)
+    weight = torch.rand((N, ), dtype=dtype, device=device, requires_grad=True)
+    bias = torch.rand((N, ), dtype=dtype, device=device, requires_grad=True)
     dy = .1 * torch.randn_like(x)
+    # setting requires_grad to True here instead of x's initial definition means the graph doesn't have to move through 
+    #  the -2.3 and 0.5 operations. That's not a big deal but if we didn't do it then our benchmark would be confounded 
+    #  by thekernels pytorch implements for entry-wise multiplication and addition
     x.requires_grad_(True)
-        # setting this here instead of x's initial definition means the graph doesn't have to move through the -2.3 and 0.5 operations
     # forward pass
-    y_tri = layer_norm(x, w_shape, weight, bias, eps)
-    y_ref = torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps).to(dtype)
+    y_tri = layernorm(x, (N,), weight, bias, eps)
+    y_ref = torch.nn.functional.layer_norm(x, (N,), weight, bias, eps).to(dtype)
     # backward pass (triton)
-    y_tri.backward(dy, retain_graph=True) # doesn't write to anything because it writed directly to .grad of inputs
+    y_tri.backward(dy, retain_graph=True) # this writes directly to x.grad, weight.grad and bias.grad
         # retain_graph is used to control whether the computation graph should be kept in memory after the backward pass. 
-        # Setting retain_graph=True allows you to perform multiple backward passes on the same graph, but it can increase memory usage, 
-        #  so it's generally recommended to use it only when necessary
-    dx_tri, dw_tri, db_tri = [_.grad.clone() for _ in [x, weight, bias]]
-    x.grad, weight.grad, bias.grad = None, None, None # equivalent to setting gradients to 0 after each SGD step
+        # Setting retain_graph=True allows you to perform multiple backward passes on the same graph, but it can increase 
+        # memory usage, so it's generally recommended to use it only when necessary for a scenario like this
+    # This detaches our gradients so that we can run pytorch on the same input tensors and test against each other later
+    dLdx_tri, dLdw_tri, dLdb_tri = [_.grad.clone() for _ in [x, weight, bias]]
+        # when denoting derivatives, it's always with respect to the loss function L and we use "d" instead of "partial"
+        #  because it's more concise albiet bad practice from a mathematician's perspective
+    x.grad, weight.grad, bias.grad = None, None, None
     # backward pass (torch)
     y_ref.backward(dy, retain_graph=True)
-    dx_ref, dw_ref, db_ref = [_.grad.clone() for _ in [x, weight, bias]]
+    dLdx_ref, dLdw_ref, dLdb_ref = [_.grad.clone() for _ in [x, weight, bias]]
     # compare
-    assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
-    assert torch.allclose(dx_tri, dx_ref, atol=1e-2, rtol=0)
-    assert torch.allclose(db_tri, db_ref, atol=1e-2, rtol=0)
-    assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0)
+    torch.testing.assert_close(y_tri, y_ref, atol=1e-2, rtol=0) 
+    torch.testing.assert_close(dLdx_tri, dLdx_ref, atol=1e-2, rtol=0)
+    torch.testing.assert_close(dLdb_tri, dLdb_ref, atol=1e-2, rtol=0)
+    torch.testing.assert_close(dLdw_tri, dLdw_ref, atol=1e-2, rtol=0)
+        # rtol=0 means we don't use relative tolerance 
 
-
+######### Step 5 #########
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['N'],
@@ -344,7 +368,7 @@ def test_layer_norm(M, N, dtype, eps=1e-5, device=DEVICE):
         plot_name='layer-norm-backward',
         args={'M': 4096, 'dtype': torch.float16, 'mode': 'backward'}, # so we're actually only benchmarking the backward pass
     ))
-def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device=DEVICE):
+def benchmark(M, N, dtype, provider, mode='backward', eps=1e-5, device=DEVICE):
     # create data
     x_shape = (M, N)
     w_shape = (x_shape[-1], )
@@ -358,7 +382,7 @@ def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device=DE
 
     def y_fwd():
         if provider == "triton":
-            return layer_norm(x, w_shape, weight, bias, eps)  # noqa: F811, E704
+            return layernorm(x, w_shape, weight, bias, eps)  # noqa: F811, E704
         if provider == "torch":
             return torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps)  # noqa: F811, E704
 
@@ -375,5 +399,11 @@ def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device=DE
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
 
-test_layer_norm(1151, 8192, torch.float16)
-bench_layer_norm.run(print_data=False, save_path='.')
+if __name__ == "__main__":
+    # always run unit-tests
+    test_layernorm_kernel(1151, 8192, torch.float16)
+
+    # Only run benchmark if explicitly requested
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--benchmark":
+        benchmark.run(save_path='.', print_data=False)
