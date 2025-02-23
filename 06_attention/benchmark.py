@@ -1,13 +1,12 @@
 import torch
-
 import triton
-import triton.language as tl
 
 DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
-from attention_original_paper import TritonAttention as attn_original_paper
-from attention_umar import TritonAttention as attn_umar
-from attention_triton_docs import _attention as attn_triton_docs
+from alternative_implementations.original_paper import TritonAttention as original_paper
+from alternative_implementations.umar import TritonAttention as umar
+from alternative_implementations.triton_docs import _attention as triton_docs
+from flash_attention import _flashattention as this_tutorial
 
 
 BATCH, N_HEADS, HEAD_DIM = 32, 32, 64 # LOWER THESE IF YOU DON'T HAVE ENOUGH RAM
@@ -20,14 +19,14 @@ for mode in ["fwd", "bwd"]:
                 x_names=["SEQ_LEN"],
                 x_vals=[2**i for i in range(8, 14)], # LOWER 14 IF YOU DON'T HAVE ENOUGH RAM
                 line_arg="provider",
-                line_vals=["torch", 'attn_original_paper', 'attn_umar', 'attn_triton_docs'],
+                line_vals=["torch", 'original_paper', 'umar', 'triton_docs'] + (['this_tutorial'] if causal else []),
                 line_names=[
                     "torch.nn.functional.scaled_dot_product_attention", 
                     "Original Paper's Psuedocode Replication", 
                     "Umar's Implementation", 
-                    "Official Triton Docs Implementation"
-                    ],
-                styles=[("red", "-"), ("blue", "-"), ("green", "-"), ("purple", "-")],
+                    "Official Triton Docs Implementation",
+                    ] + (["This tutorial's optimized implementation"] if causal else []),
+                styles=[("red", "-"), ("blue", "-"), ("green", "-"), ("purple", "-")] + ([("pink", "-")] if causal else []),
                 ylabel="TFLOPS",
                 plot_name=f"attention-performance-{mode}-causal={causal}",
                 args={
@@ -49,12 +48,14 @@ def bench_flash_attention(BATCH, H, SEQ_LEN, HEAD_DIM, causal, mode, provider, d
     sm_scale = 1.3
     if provider == 'torch':
         fn = lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal)
-    if provider == 'attn_original_paper':
-        fn = lambda: attn_original_paper.apply(q, k, v, causal, sm_scale)
-    if provider == 'attn_umar':
-        fn = lambda: attn_umar.apply(q, k, v, causal, sm_scale)
-    if provider == 'attn_triton_docs':
-        fn = lambda: attn_triton_docs.apply(q, k, v, causal, sm_scale)
+    if provider == 'original_paper':
+        fn = lambda: original_paper.apply(q, k, v, causal, sm_scale)
+    if provider == 'umar':
+        fn = lambda: umar.apply(q, k, v, causal, sm_scale)
+    if provider == 'triton_docs':
+        fn = lambda: triton_docs.apply(q, k, v, causal, sm_scale)
+    if provider == 'this_tutorial':
+        fn = lambda: this_tutorial.apply(q, k, v, sm_scale)
     if mode == "bwd":
         O = fn()
         dO = torch.randn_like(O)

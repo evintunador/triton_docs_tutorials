@@ -1,5 +1,5 @@
 """
-this is an implementation of the flash-attention pseudocode from the original paper
+this is an implementation of the flash-attention-2 pseudocode from the original paper
 https://arxiv.org/pdf/2307.08691
 """
 

@@ -1,9 +1,15 @@
 """
-this is a fused-attention implementation implemented by Umar Jamil. See his 8 hour tutorial for an alternative to mine
+this is a fused-attention implementation implemented by Umar Jamil. 
+See his 8 hour tutorial for an alternative to mine
 https://github.com/hkproj/triton-flash-attention
 
 he built it based on the official triton documentation implementation, but the edits he made in the name of 
-learnability also made it slower in the backward pass
+learnability also made it significantly slower in the backward pass.
+i don't think he realized this since he didn't seem to implement a benchmark to test the speed of his code
+
+I may have edited this code quite heavily but I cannot remember. 
+If so most of my edits likely had to do with readability, comments, changing variable names, and other
+mostly non-functional edits
 """
 
 

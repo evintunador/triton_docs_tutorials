@@ -1,3 +1,15 @@
+"""
+this is an implementation of fused attention from the official triton documentation
+it's actually an improvement over flash-attention 2
+https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html#sphx-glr-getting-started-tutorials-06-fused-attention-py
+
+it should be noted that in their original code, they wrote a unit-test and then forgot
+to ever actually call it, which is why this test does not pass (the only thing i added
+was a line to actualy call the test). 
+the error might've had to do with the scale term or accounting for the derivative of 
+using tl.exp2() instead of tl.exp() but i can't remember
+"""
+
 import pytest
 import torch
 import triton.tools.experimental_descriptor
