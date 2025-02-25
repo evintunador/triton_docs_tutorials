@@ -159,7 +159,7 @@ def softmax(x):
     BLOCK_SIZE = triton.next_power_of_2(n_cols)
 
     # a trick we can use is to ask the compiler to use more threads per row by
-    #   increasing the number of warps (`num_warps`) over which each row is distributed.
+    #  increasing the number of warps (`num_warps`) over which each row is distributed.
     # for now these settings are just a heuristic
     # you will see in the next tutorial how to auto-tune this value in a more natural way
     #   so you don't have to come up with manual heuristics yourself
@@ -227,7 +227,7 @@ def softmax(x):
     grid = (num_programs, 1, 1)
         # the extra 1's are usually not necessary if they're not being used
         # we use them here because the .warmup() we used earlier has a weird quirk in the way
-        #  it's implemented that forced only 3D launch grids to be inputted once it's been used
+        #  it's implemented that forces only 3D launch grids to be inputted once it's been used
         # in future lessons we don't use .warmup() so we'll not be required to do this again
 
     # And now we get to run the kernel with our heuristics-based launch grid
