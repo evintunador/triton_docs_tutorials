@@ -1,6 +1,5 @@
 """
-This "fused softmax" kernel will be significantly faster than pytorch's native op
- for a particular class of matrices: those whose rows can fit in the GPU's SRAM.
+This "fused softmax" kernel only works on matrices whose rows fit in the GPU's SRAM.
 
 What you'll learn:
 - The importance of reducing memory reads/writes
@@ -224,15 +223,15 @@ def softmax(x):
     num_programs = min(NUM_SM * programs_per_sm, n_rows)
         # ofc we have another limit since we've got no need to surpass the n_rows in the matrix
 
-    # grid configuration
-    grid_config = (num_programs,)
-        # first dimension: number of programs in x-directoin. Each row gets its own program
-        # our data parallelism is only along rows (first dimension) so we don't need 2D or 3D parallelism
-            # for matrix multiplication you would use (M, N)
-            # for 3D convolution you'd use (X, Y, Z)
+    # grid configuration; each row gets its own program
+    grid = (num_programs, 1, 1)
+        # the extra 1's are usually not necessary if they're not being used
+        # we use them here because the .warmup() we used earlier has a weird quirk in the way
+        #  it's implemented that forced only 3D launch grids to be inputted once it's been used
+        # in future lessons we don't use .warmup() so we'll not be required to do this again
 
     # And now we get to run the kernel with our heuristics-based launch grid
-    kernel[grid_config](
+    kernel[grid](
         x, y,
         x.stride(0), y.stride(0),
         n_rows, n_cols,
@@ -250,7 +249,7 @@ def test_softmax_kernel(size: tuple, atol=1e-3, rtol=1e-3, device=DEVICE):
     """
     # create input data
     torch.manual_seed(0)
-    assert type(size) == tuple and len(size == 2)
+    assert type(size) is tuple and len(size) == 2
     x = torch.randn(size[0], size[1], device=DEVICE)
     # run kernel & pytorch reference implementation
     z_tri = softmax(x)

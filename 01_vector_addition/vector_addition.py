@@ -22,6 +22,11 @@ import triton.language as tl
 DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
 ######### Step 3 #########
+
+# un-comment this to run a numpy emulation of Triton on CPU & be able to debug with print() statements
+#import os
+#os.environ["TRITON_INTERPRET"] = "1"
+
 # this `triton.jit` decorator tells Triton to compile this function into GPU code
 @triton.jit # only a subset of python capabilities are useable within a triton kernel
 def add_kernel(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr): 

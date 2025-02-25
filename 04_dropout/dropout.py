@@ -29,7 +29,7 @@ def _seeded_dropout(
     # this line generates uniformly distributed float32 values in [0, 1), given a seed and a block of int32 oﬀsets
     random = tl.rand(seed, offsets) # shape (BLOCK_SIZE)
     # prune based on our desired probability threshold
-    x_keep = random > p # true or false so full of 0's and 1's
+    x_keep = random > p # values are either true or false
     output = tl.where(x_keep, x / (1 - p), 0.0)
         # where x_keep is True, the value is x/(1-p), and where False it's 0.0
     # write-back to DRAM
@@ -43,8 +43,8 @@ def seeded_dropout(x, p, seed):
     _seeded_dropout[grid](x, output, n_elements, p, seed, BLOCK_SIZE=1024)
     return output
 
-x = torch.randn(size=(10, ), device=DEVICE)
+x = torch.randn(size=(8, ), device=DEVICE)
 output1 = seeded_dropout(x, p=0.5, seed=123)
 output2 = seeded_dropout(x, p=0.5, seed=123)
 output3 = seeded_dropout(x, p=0.5, seed=512)
-print(x, output1, output2, output3)
+print(x, output1, output2, output3, sep="\n")

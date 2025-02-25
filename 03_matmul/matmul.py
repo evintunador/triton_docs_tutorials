@@ -237,7 +237,7 @@ def _matmul_kernel(
         # Now we load blocks of A and B matrices. If multiple blocks in a group are on the same SM, 
         # they can share these loaded values, which reduces the number of expensive loads from DRAM
         a = tl.load(a_ptr + a_offsets, mask=mask[None, :], other=0.0) # shape (BLOCK_SIZE_M, BLOCK_SIZE_K)
-        b = tl.load(b_ptr + a_offsets, mask=mask[:, None], other=0.0) # shape (BLOCK_SIZE_K, BLOCK_SIZE_N)
+        b = tl.load(b_ptr + b_offsets, mask=mask[:, None], other=0.0) # shape (BLOCK_SIZE_K, BLOCK_SIZE_N)
             # fill in any masked-out parts with 0.0's since they don't have any effect on the summation in the next step
 
         # we accumulate along the K dimension
@@ -311,7 +311,7 @@ def test_matmul_kernel(size: tuple, atol=1e-2, rtol=1e-1, device=DEVICE): # TODO
     """
     # create input data
     torch.manual_seed(0)
-    assert type(size) == tuple and len(size == 2)
+    assert type(size) == tuple and len(size) == 2
     a = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
     b = torch.randn((512, 512), device=DEVICE, dtype=torch.float16)
     # run kernel & pytorch reference implementation
