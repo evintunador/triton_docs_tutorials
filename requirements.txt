@@ -1,0 +1,6 @@
+pytest==7.4.4
+torch==2.4.0
+triton==3.2.0
+numpy
+matplotlib
+pandas
