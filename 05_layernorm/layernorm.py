@@ -107,7 +107,6 @@ def _layernorm_backward_dLdx(
     and it's that pid's job to accumulate the gradients over all of the rows it has been assigned
     then once each pid is done, in the next kernel we'll accumulate all of those individiual partial sums
     """
-
     # Map the program id to the elements of x, dLdx, and dLdy it should compute.
     PID = tl.program_id(0)
     cols = tl.arange(0, BLOCK_SIZE_N)
@@ -187,7 +186,7 @@ def _layernorm_backward_dLdx(
     """
     # To start we figure out which lock ID corresponds to our PID and move our pointers accordingly
     lock_id = PID % GROUP_SIZE # so there are GROUP_SIZE number of locks
-    # the first GROUP_SIZE entries in Lock hold the state of that lock in the entry Lock_ptr for each pid
+    # the first GROUP_SIZE entries in Lock hold the state of that lock in the entry locks_ptr for each pid
     locks_ptr += lock_id
     # the next GROUP_SIZE entries hold the count of how many accumulations have already happened on that lock
     count_ptr = locks_ptr + GROUP_SIZE
@@ -366,9 +365,9 @@ class LayerNorm(torch.autograd.Function):
         
         # enqueue kernel that uses forward pass heuristics to calculate both dLdx and the partial sums of dLdw and dLdb
         _layernorm_backward_dLdx[(M, )](  # parallelize across rows
-            dLdx, dLdy, _dLdw, _dLdb, x, w, mean, rstd, locks,  # all of our tensors that'll get turned into pointers
+            x, dLdx, dLdy, w, _dLdw, _dLdb, mean, rstd, locks,  # all of our tensors that'll get turned into pointers
             x.stride(0), N,  # dynamic run-time variables
-            BLOCK_SIZE_N = ctx.BLOCK_SIZE, GROUP_SIZE = GROUP_SIZE, num_warps = ctx.num_warps) # static compile-time variables
+            GROUP_SIZE = GROUP_SIZE, BLOCK_SIZE_N = ctx.BLOCK_SIZE, num_warps = ctx.num_warps) # static compile-time variables
         
         # Now we'll do a seperate call to the second kernel, who's job is to accumulate _dLdw into dLdw and _dLdb into dLdb.
         # We do this in a separate kernel since this final set of operations requires 
