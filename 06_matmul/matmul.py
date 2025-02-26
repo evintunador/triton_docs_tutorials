@@ -34,6 +34,11 @@ import triton.language as tl
 DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
 ######### Step 3 #########
+
+# un-comment this to run a numpy emulation of Triton on CPU & be able to debug with print() statements
+#import os
+#os.environ["TRITON_INTERPRET"] = "1"
+
 # autotuning is just setting up a bunch of different potential meta-parameters configurations that Triton will automatically
 # choose from later based on which one performs best on our specific GPU. Triton will figure out for us which one to use. They're 
 # all values chosen heuristically, but notice everything is a multiple of 32 in sticking w/ the number of threads in a warp.
