@@ -13,7 +13,9 @@ Step 2 - wrapper
 Step 3 - kernel
 Step 4 - benchmark
 
-see original
+watch the accompanying YouTube video:
+https://youtu.be/fYMS4IglLgg
+see original triton documentation:
 https://triton-lang.org/main/getting-started/tutorials/01-vector-add.html#sphx-glr-getting-started-tutorials-01-vector-add-py
 """
 import torch

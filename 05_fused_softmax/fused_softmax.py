@@ -18,7 +18,9 @@ Step 3 - wrapper
 Step 4 - kernel
 Step 5 - benchmark
 
-see original
+watch the accompanying YouTube video:
+https://youtu.be/ftknUZDQCPc
+see original triton documentation:
 https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html
 """
 import torch
