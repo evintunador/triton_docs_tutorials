@@ -18,6 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
+DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
 @triton.jit
 def _attn_fwd_inner(

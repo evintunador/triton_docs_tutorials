@@ -21,6 +21,7 @@ TODO fp16 to fp32 acc
 import torch
 import triton
 import triton.language as tl
+import math
 
 DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
@@ -101,7 +102,7 @@ def _attn_fwd_inner(
         V = tl.load(V_ptr + V_offsets, mask=N_mask_KV[:, None], other=0.) # shape (BLOCK_SIZE_KV, Dh)
         O = O * alpha[:, None] # adjusts previous values based on potential new max
         # accumulated P and V block dot product into O
-        O = tl.dot(P, V, acc=O) # shape (BLOCK_SIZE_QO, Dh)
+        O = tl.dot(P.to(tl.float32), V, acc=O) # shape (BLOCK_SIZE_QO, Dh)
             # notice we're doing this V projection before we've actually divided by our softmax denominator l_i
             #  which is possible because in this context the two operations are associative
             # acc tells triton to accumulate the values into O_block
@@ -189,8 +190,8 @@ def attn_fwd(
         # shape (BLOCK_SIZE_KV, Dh)
 
     # load the block of Q that this PID will use: it will stay in SRAM throughout the inner loop
-    N_mask_QO = offsets_QO_N < N
-    Q = tl.load(Q_ptr + Q_offsets, mask=N_mask_QO[:, None], other=0.) # shape (BLOCK_SIZE_QO, Dh)
+    mask_QO_N = offsets_QO_N < N
+    Q = tl.load(Q_ptr + Q_offsets, mask=mask_QO_N[:, None], other=0.) # shape (BLOCK_SIZE_QO, Dh)
         # sequence mask sets non-existent tokens in the block past N to zero vector
 
     ## pre-allocate tensors for storing intermediate & output values
@@ -257,7 +258,7 @@ def attn_fwd(
         # the mask prevents us from saving the useless log_2(n) values at the bottom of LSE
     O_offsets = (offsets_QO_N[:, None] * stride_O_N + offsets_Dh[None, :] * stride_O_Dh)
         # shape (BLOCK_SIZE_Q, Dh)
-    tl.store(O_ptr + O_offsets, O, mask=N_mask_QO[:, None])
+    tl.store(O_ptr + O_offsets, O.to(tl.float32), mask=mask_QO_N[:, None])
         # the mask prevents us from saving the useless values at the bottom of O corresponding to non-existent tokens
 
 
@@ -642,7 +643,7 @@ class _flashattention(torch.autograd.Function):
         assert q.shape[-1] in (32, 64, 128, 256), \
             f'flash attention only supports head dimension of 32, 64, 128 or 256 but got {q.shape[-1]}'
             # the kernel actually isn't this limited but too much larger and i think it might overwhelm SRAM
-        B, H, N, D = q.shape
+        B, H, N, Dh = q.shape
         assert q.device == k.device and q.device == v.device
 
         # pre-allocate output tensor
@@ -662,12 +663,12 @@ class _flashattention(torch.autograd.Function):
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             O.stride(0), O.stride(1), O.stride(2), O.stride(3),
             LSE.stride(0), LSE.stride(1), LSE.stride(2),
-            B, H, N, D,
+            B, H, N, Dh,
         )
 
         ctx.save_for_backward(q, k, v, O, LSE)
         ctx.grid = grid
-        ctx.B, ctx.H, ctx.N, ctx.D = B, H, N, D
+        ctx.B, ctx.H, ctx.N, ctx.Dh = B, H, N, Dh
         ctx.scale = scale
         return O
 
@@ -676,7 +677,7 @@ class _flashattention(torch.autograd.Function):
         q, k, v, O, LSE = ctx.saved_tensors
         grid = ctx.grid
         scale=ctx.scale
-        B, H, N, D = ctx.B, ctx.H, ctx.N, ctx.D
+        B, H, N, Dh = ctx.B, ctx.H, ctx.N, ctx.Dh
 
         dLdq = torch.empty_like(q)
         dLdk = torch.empty_like(k)
@@ -695,7 +696,7 @@ class _flashattention(torch.autograd.Function):
             O.stride(0), O.stride(1), O.stride(2), O.stride(3),
             dLdO.stride(0), dLdO.stride(1), dLdO.stride(2), dLdO.stride(3),
             Delta.stride(0), Delta.stride(1), Delta.stride(2),
-            N, D,
+            N, Dh,
         )
 
         grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE_MACRO"]), B * H) 
@@ -705,26 +706,57 @@ class _flashattention(torch.autograd.Function):
             LSE, Delta,
             scale,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3), # all tensors should share same stride
-            H, N, D,
+            H, N, Dh,
         )
 
         return dLdq, dLdk, dLdv, None
+
+triton_attention = _flashattention.apply
     
 
 ######### Step 1 #########
-def test_flashattention_kernel(M, N, dtype, eps=1e-5, device=DEVICE):
+def test_flashattention_kernel(B, H, N, Dh, device=DEVICE):
     # create data
-    
-    
+    q = torch.randn((B, H, N, Dh), dtype=torch.float32, device=device, requires_grad=True)
+    k = torch.randn((B, H, N, Dh), dtype=torch.float32, device=device, requires_grad=True)
+    v = torch.randn((B, H, N, Dh), dtype=torch.float32, device=device, requires_grad=True)
+    sm_scale = math.sqrt(Dh) # idk why I made scale a parameter to be passed in
     # forward pass
-    
+    tri_out = triton_attention(q, k, v, sm_scale)
+    ref_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+    # compare
+
+    print(tri_out)
+    print(ref_out)
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    # Convert to numpy arrays
+    actual = tri_out.detach().cpu().numpy()
+    expected = ref_out.detach().cpu().numpy()
+    # Compute differences and masks
+    abs_diff = np.abs(expected - actual)
+    abs_fail_mask = (abs_diff > 1e-2).astype(np.int32)
+    plt.figure(figsize=(8, 6))
+    plt.imshow(abs_fail_mask[0][0], cmap="hot", aspect="auto")
+    plt.xlabel("Model/Head Dimension")
+    plt.ylabel("Sequence Position")
+    plt.colorbar()
+    plt.savefig('./heatmap.png')
+    plt.close()
+
+    torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0) 
+    print("passed fwd")
+
     # backward pass (triton)
     
     # backward pass (torch)
     
     # compare
-    torch.testing.assert_close(y_tri, y_ref, atol=1e-2, rtol=0) 
+    
 
 if __name__ == "__main__":
     # always run unit-tests
-    test_flashattention_kernel(1151, 8192, torch.float16)
+    test_flashattention_kernel(1, 1, 32, 32) # without block masking
+    test_flashattention_kernel(32, 8, 2048, 128) # without block masking
+    test_flashattention_kernel(32, 8, 2013, 128) # with block masking
