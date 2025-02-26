@@ -403,6 +403,8 @@ def test_layernorm_kernel(M, N, dtype, eps=1e-5, device=DEVICE):
     # forward pass
     y_tri = layernorm(x, (N,), weight, bias, eps)
     y_ref = torch.nn.functional.layer_norm(x, (N,), weight, bias, eps).to(dtype)
+    torch.testing.assert_close(y_tri, y_ref, atol=1e-2, rtol=0) 
+    print("Passed fwd")
     # backward pass (triton)
     y_tri.backward(dLdy, retain_graph=True) # this writes directly to x.grad, weight.grad and bias.grad
         # retain_graph is used to control whether the computation graph should be kept in memory after the backward pass. 
@@ -417,11 +419,11 @@ def test_layernorm_kernel(M, N, dtype, eps=1e-5, device=DEVICE):
     y_ref.backward(dLdy, retain_graph=True)
     dLdx_ref, dLdw_ref, dLdb_ref = [_.grad.clone() for _ in [x, weight, bias]]
     # compare
-    torch.testing.assert_close(y_tri, y_ref, atol=1e-2, rtol=0) 
     torch.testing.assert_close(dLdx_tri, dLdx_ref, atol=1e-2, rtol=0)
     torch.testing.assert_close(dLdb_tri, dLdb_ref, atol=1e-2, rtol=0)
     torch.testing.assert_close(dLdw_tri, dLdw_ref, atol=1e-2, rtol=0)
         # rtol=0 means we don't use relative tolerance 
+    print("Passed bwd")
 
 
 ######### Step 5 #########
