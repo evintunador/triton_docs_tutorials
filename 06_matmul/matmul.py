@@ -6,6 +6,7 @@ This matmul kernel can be a bit confusing but is very crucial to understand
 - Program re-ordering for improved SRAM hit rate
 - Multi-dimensional pointer arithmetic
 - High precision data type accumulation
+- using the Triton interpreter (kind of)
 
 Recommended order to read the code in:
 Step 1 - unit test
