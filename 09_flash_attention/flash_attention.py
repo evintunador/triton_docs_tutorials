@@ -38,12 +38,42 @@ def _attn_fwd_inner(
     offsets_QO_N: tl.constexpr, offsets_KV_N: tl.constexpr,
     N: tl.constexpr, Dh: tl.constexpr,
 ):
+    """
+    arrows indicate direction of this pid's for loop; each arrow is a different PID
+                N of K & V
+                ------------>
+                ------------>
+    N of Q      ------------>
+                ------------>
+                ------------>
+    but if we actually take into account the causal mask then really it's more like
+                N of K & V
+                >
+                --->
+    N of Q      ------>
+                --------->
+                ------------>
+    and to get even more accurate, we do the diagonal in our first call of this inner kernel
+                N of K & V
+                x
+                   x
+    N of Q            x
+                         x
+                            x
+    and then the next call gets all the parts below the diagonal
+                N of K & V
+                
+                -->
+    N of Q      ----->
+                -------->
+                ----------->
+    """
     if DIAGONAL:
         # Used only for the blocks along the diagonal in which there is transition between non-masked and masked keys
         lo = block_index_QO * BLOCK_SIZE_QO
         hi = (block_index_QO + 1) * BLOCK_SIZE_QO
         # let the compiler know lo is a muliple of BLOCK_SIZE_QO to speed things up
-        lo = tl.multiple_of(lo, BLOCK_SIZE_QO) # TODO not sure why this doesn't also help with hi
+        lo = tl.multiple_of(lo, BLOCK_SIZE_QO) # TODO not sure why this doesn't also help with hi; it prolly does
     else: 
         # this part is for any blocks in the causal mask below the diagonal
         lo, hi = 0, block_index_QO * BLOCK_SIZE_QO
@@ -56,12 +86,12 @@ def _attn_fwd_inner(
     for start_KV in range(lo, hi, BLOCK_SIZE_KV):
         # Just let the compiler know that start_KV is a multiple of BLOCK_SIZE_KV, so the compiler can do optimizations
         start_KV = tl.multiple_of(start_KV, BLOCK_SIZE_KV)
-            # when in doubt, use tl.multiple_of() for any dynamic variable (as opposed to static variables)
+            # when in doubt, i guess use tl.multiple_of() for any dynamic variable (as opposed to static variables)
 
-        # compute (Q @ K^T) / sqrt{Dh}
-        N_mask_KV = offsets_KV_N < N
-        K_T = tl.load(K_ptr + K_T_offsets, mask=N_mask_KV[None, :], other=0.) # shape (Dh, BLOCK_SIZE_KV)
-            # sequence mask sets non-existent tokens in the block past N to zero vector
+        # compute (Q @ K^T) / sqrt(Dh)
+        mask_KV_N = offsets_KV_N < N
+        K_T = tl.load(K_ptr + K_T_offsets, mask=mask_KV_N[None, :], other=0.) # shape (Dh, BLOCK_SIZE_KV)
+            # sequence mask sets non-existent tokens in the block past N to zero vectors
         S = tl.dot(Q, K_T) * softmax_scale # shape (BLOCK_SIZE_QO, BLOCK_SIZE_KV)
             # the masked tokens create columns & rows of zeros hugging the bottom and right edges of S
 
@@ -70,7 +100,7 @@ def _attn_fwd_inner(
             causal_mask = offsets_QO_N[:, None] >= (offsets_KV_N[None, :])
             # causal mask addition sets upper-triangular values (excluding diagonal) to -inf
             S += tl.where(causal_mask, 0, -1.0e6) # shape (BLOCK_SIZE_QO, BLOCK_SIZE_KV)
-        # notice that the masked out tokens previously hugging the right edge of S have all been replaced with -inf
+        # notice that the masked out tokens previously hugging the right edge of S have mostly been replaced with -inf
         #  and the masked out tokens hugging the bottom edge are still mostly 0's but with some -infs towards the
         #  right edge of each of them, except for the last one which is only 0's
         
@@ -99,10 +129,10 @@ def _attn_fwd_inner(
             # for each of the masked non-existent tokens they approach N for their entry L_i
 
         # This computes O = P @ V + O * alpha
-        V = tl.load(V_ptr + V_offsets, mask=N_mask_KV[:, None], other=0.) # shape (BLOCK_SIZE_KV, Dh)
+        V = tl.load(V_ptr + V_offsets, mask=mask_KV_N[:, None], other=0.) # shape (BLOCK_SIZE_KV, Dh)
         O = O * alpha[:, None] # adjusts previous values based on potential new max
         # accumulated P and V block dot product into O
-        O = tl.dot(P.to(tl.float32), V, acc=O) # shape (BLOCK_SIZE_QO, Dh)
+        O = tl.dot(P.to(tl.float16), V, acc=O) # shape (BLOCK_SIZE_QO, Dh)
             # notice we're doing this V projection before we've actually divided by our softmax denominator l_i
             #  which is possible because in this context the two operations are associative
             # acc tells triton to accumulate the values into O_block
@@ -126,27 +156,26 @@ def _attn_fwd_inner(
             {"BLOCK_SIZE_QO": BLOCK_SIZE_QO, "BLOCK_SIZE_KV": BLOCK_SIZE_KV},
             num_stages=num_stages, num_warps=num_warps,
         )
-        for BLOCK_SIZE_QO in [16, 32, 64, 128]
-        for BLOCK_SIZE_KV in [16, 32, 64, 128]
-        for num_stages in [1, 3, 5, 7]
-        for num_warps in [2, 4, 8, 16]
-        if BLOCK_SIZE_QO == BLOCK_SIZE_KV # TODO they should only be one hyperparameter then
+        for BLOCK_SIZE_QO in [16]#, 32, 64]
+        for BLOCK_SIZE_KV in [16]#, 32, 64]
+        for num_stages in [1]#, 3, 5]
+        for num_warps in [2]#, 4, 8]
     ],
-    key=["N", "D"], # auto-tune will re-run every time either of these values changes in a new input
+    key=["N", "Dh"], # auto-tune will re-run every time either of these values changes in a new input
     # TODO is there a way to make it only change when N surpasses a new multiple of BLOCK_SIZE?
 )
 @triton.jit
 def attn_fwd(
-    Q_ptr, K_ptr,  V_ptr,  # each shape (B, H, N, Dh)
-    O_ptr,  # shape (B, H, N, Dh). where we store the final output
-    LSE_ptr,  # shape (B, H, N). here we first store the max values of each row & later the logsumexp trick 
+    Q_ptr, K_ptr,  V_ptr,               # each shape (B, H, N, Dh)
+    O_ptr,                              # shape (B, H, N, Dh). where we store the final output
+    LSE_ptr,                            # shape (B, H, N). here we first store the max values of each row & later the logsumexp trick 
     softmax_scale,
-    stride_Q_B, stride_Q_H, stride_Q_N, stride_Q_Dh, # dist to move thru mem to next entry in that dim of that tensor
+    stride_Q_B, stride_Q_H, stride_Q_N, stride_Q_Dh,
     stride_K_B, stride_K_H, stride_K_N, stride_K_Dh,
     stride_V_B, stride_V_H, stride_V_N, stride_V_Dh,
     stride_O_B, stride_O_H, stride_O_N, stride_O_Dh,
     stride_LSE_B, stride_LSE_H, stride_LSE_N,
-    B, # unlike other tensor dimensions, batch size needs to be flexible for runtime differences
+    B, # unlike other tensor dimensions, batch size can be more flexible for runtime differences
     # meta-parameters (decided at compile-time)
     H: tl.constexpr, N: tl.constexpr, 
     Dh: tl.constexpr, # should always be a power of 2, and really 128 and 256 are the only reasonable options
@@ -155,10 +184,20 @@ def attn_fwd(
     # in order to use tl.exp2 later isntead of tl.exp (the former is faster) we need to scale our softmax scale by ln2
     rln2: tl.constexpr = 1.4426950408889634
     softmax_scale *= rln2
+    """
+    let's show that e^x = 2^(x * rln2)
+    e^x = (2^(log_2(e)))^x since a = 2^log_2(a)
+    then using the power rule
+    (2^(log_2(e)))^x = 2^(x * log_2(e))
+    fundamental property of logarithm is log_2(e) = 1/log_e(2)
+    therefore e^x = 2^(x * 1/log_e(2)) 
+    AKA e^x = 2^(x * rln2)
+    then later in the backward pass we'll have to remember to account for this in the gradient
+    """
     
     # as opposed to regular assert, static_assert occurs at compile-time
     tl.static_assert(BLOCK_SIZE_KV <= Dh)
-        # Dh is usually relatively small (128 or 256) so it wouldn't make sense to parallelize within it
+        # I'm not sure why the original triton docs tutorial had this assertion, but it doesn't hurt anything
 
     # This indicates which block in the sequence length to process
     block_index_QO = tl.program_id(0)
@@ -176,7 +215,7 @@ def attn_fwd(
     O_ptr += index_B * stride_O_B + index_H * stride_O_H
 
     # Offsets for N are split by pids but for Dh we keep the whole thing in SRAM.
-    offsets_QO_N = block_index_QO * BLOCK_SIZE_QO + tl.arange(0, BLOCK_SIZE_QO) # shape (BLOCK_SIZE_QO)
+    offsets_QO_N = block_index_QO * BLOCK_SIZE_QO + tl.arange(0, BLOCK_SIZE_QO)
     offsets_KV_N = tl.arange(0, BLOCK_SIZE_KV)
     offsets_Dh = tl.arange(0, Dh)
     
@@ -189,10 +228,10 @@ def attn_fwd(
     V_offsets = (offsets_KV_N[:, None] * stride_V_N + offsets_Dh[None, :] * stride_V_Dh)
         # shape (BLOCK_SIZE_KV, Dh)
 
-    # load the block of Q that this PID will use: it will stay in SRAM throughout the inner loop
+    # load the block of Q that this PID will use; it will stay in SRAM throughout the inner loop
     mask_QO_N = offsets_QO_N < N
     Q = tl.load(Q_ptr + Q_offsets, mask=mask_QO_N[:, None], other=0.) # shape (BLOCK_SIZE_QO, Dh)
-        # sequence mask sets non-existent tokens in the block past N to zero vector
+        # sequence mask sets non-existent tokens in the block past N to zero vectors
 
     ## pre-allocate tensors for storing intermediate & output values
     # the running maximum. We have one entry for each query in the block we're currently working on
@@ -258,7 +297,7 @@ def attn_fwd(
         # the mask prevents us from saving the useless log_2(n) values at the bottom of LSE
     O_offsets = (offsets_QO_N[:, None] * stride_O_N + offsets_Dh[None, :] * stride_O_Dh)
         # shape (BLOCK_SIZE_Q, Dh)
-    tl.store(O_ptr + O_offsets, O.to(tl.float32), mask=mask_QO_N[:, None])
+    tl.store(O_ptr + O_offsets, O.to(tl.float16), mask=mask_QO_N[:, None])
         # the mask prevents us from saving the useless values at the bottom of O corresponding to non-existent tokens
 
 
@@ -270,7 +309,7 @@ def attn_fwd(
         for num_stages in [1, 3, 5]
         for num_warps in [2, 4, 8]
     ],
-    key=["N", "D"], # auto-tune will re-run every time either of these values changes in a new input
+    key=["N", "Dh"], # auto-tune will re-run every time either of these values changes in a new input
 )
 @triton.jit
 def attn_backward_preprocess(
@@ -464,7 +503,7 @@ def _attn_backward_Q(
         for num_warps in [2, 4, 8, 16]
         if BLOCK_SIZE_MACRO > BLOCK_SIZE_MICRO # could do >= but i wanna get mileage out of the loop code we wrote
     ],
-    key=["N", "D"], # auto-tune will re-run every time either of these values changes in a new input
+    key=["N", "Dh"], # auto-tune will re-run every time either of these values changes in a new input
     # TODO is there a way to make it only change when N surpasses a new multiple of BLOCK_SIZE?
 )
 @triton.jit
@@ -655,6 +694,9 @@ class _flashattention(torch.autograd.Function):
             triton.cdiv(N, args["BLOCK_SIZE_QO"]), # primary parallelizatoin is across sequence length
             B * H, # further parallelize across the dimensions that don't matter
         )
+        # notice the sequence dimension axis is first, and BH parallelization axis is second
+        # this is because we want the former to have PIDs on the same SM
+
         attn_fwd[grid](
             q, k, v, O, LSE, 
             scale,
@@ -676,7 +718,7 @@ class _flashattention(torch.autograd.Function):
     def backward(ctx, dLdO):
         q, k, v, O, LSE = ctx.saved_tensors
         grid = ctx.grid
-        scale=ctx.scale
+        scale = ctx.scale
         B, H, N, Dh = ctx.B, ctx.H, ctx.N, ctx.Dh
 
         dLdq = torch.empty_like(q)
@@ -717,17 +759,15 @@ triton_attention = _flashattention.apply
 ######### Step 1 #########
 def test_flashattention_kernel(B, H, N, Dh, device=DEVICE):
     # create data
-    q = torch.randn((B, H, N, Dh), dtype=torch.float32, device=device, requires_grad=True)
-    k = torch.randn((B, H, N, Dh), dtype=torch.float32, device=device, requires_grad=True)
-    v = torch.randn((B, H, N, Dh), dtype=torch.float32, device=device, requires_grad=True)
-    sm_scale = math.sqrt(Dh) # idk why I made scale a parameter to be passed in
+    q = torch.randn((B, H, N, Dh), dtype=torch.float16, device=device, requires_grad=True)
+    k = torch.randn((B, H, N, Dh), dtype=torch.float16, device=device, requires_grad=True)
+    v = torch.randn((B, H, N, Dh), dtype=torch.float16, device=device, requires_grad=True)
+    sm_scale = 1/math.sqrt(Dh) # idk why I made scale a parameter to be passed in, whatever too late now
     # forward pass
     tri_out = triton_attention(q, k, v, sm_scale)
     ref_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
-    # compare
 
-    print(tri_out)
-    print(ref_out)
+    """
     import os
     import numpy as np
     import matplotlib.pyplot as plt
@@ -744,7 +784,9 @@ def test_flashattention_kernel(B, H, N, Dh, device=DEVICE):
     plt.colorbar()
     plt.savefig('./heatmap.png')
     plt.close()
+    """
 
+    # compare
     torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0) 
     print("passed fwd")
 
@@ -757,6 +799,6 @@ def test_flashattention_kernel(B, H, N, Dh, device=DEVICE):
 
 if __name__ == "__main__":
     # always run unit-tests
-    test_flashattention_kernel(1, 1, 32, 32) # without block masking
-    test_flashattention_kernel(32, 8, 2048, 128) # without block masking
-    test_flashattention_kernel(32, 8, 2013, 128) # with block masking
+    test_flashattention_kernel(1, 1, 128, 128) # without block masking
+    test_flashattention_kernel(32, 8, 512, 128) # without block masking
+    test_flashattention_kernel(32, 8, 511, 128) # with block masking
