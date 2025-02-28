@@ -1,0 +1,3 @@
+SEQ_LEN,torch.nn.functional.scaled_dot_product_attention,Original Paper's Psuedocode Replication,Umar's Implementation,Official Triton Docs Implementation,This tutorial's optimized implementation
+256.000000,5.841114,4.025933,6.330342,6.167554,6.414138
+512.000000,9.973100,4.839411,9.150551,10.242115,9.113222

@@ -1,5 +1,6 @@
 import torch
 import triton
+import math
 
 DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
@@ -9,15 +10,15 @@ from alternative_implementations.triton_docs import _attention as triton_docs
 from flash_attention import _flashattention as this_tutorial
 
 
-BATCH, N_HEADS, HEAD_DIM = 32, 32, 64 # LOWER THESE IF YOU DON'T HAVE ENOUGH RAM
+BATCH, N_HEADS, HEAD_DIM = 32, 4, 64 # LOWER THESE IF YOU DON'T HAVE ENOUGH RAM
 # vary seq length for fixed head and batch=4
 configs = []
 for mode in ["fwd", "bwd"]:
-    for causal in [True, False]:
+    for causal in [True]:#, False]:
         configs.append(
             triton.testing.Benchmark(
                 x_names=["SEQ_LEN"],
-                x_vals=[2**i for i in range(8, 14)], # LOWER 14 IF YOU DON'T HAVE ENOUGH RAM
+                x_vals=[2**i for i in range(8, 10)], # LOWER IF YOU DON'T HAVE ENOUGH RAM
                 line_arg="provider",
                 line_vals=["torch", 'original_paper', 'umar', 'triton_docs'] + (['this_tutorial'] if causal else []),
                 line_names=[
@@ -42,10 +43,10 @@ for mode in ["fwd", "bwd"]:
 def bench_flash_attention(BATCH, H, SEQ_LEN, HEAD_DIM, causal, mode, provider, device=DEVICE):
     assert mode in ["fwd", "bwd"]
     dtype = torch.float16
-    q = torch.randn((BATCH, H, SEQ_LEN, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-    k = torch.randn((BATCH, H, SEQ_LEN, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-    v = torch.randn((BATCH, H, SEQ_LEN, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-    sm_scale = 1.3
+    q = 0.02 * torch.randn((BATCH, H, SEQ_LEN, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    k = 0.02 * torch.randn((BATCH, H, SEQ_LEN, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    v = 0.02 * torch.randn((BATCH, H, SEQ_LEN, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    sm_scale = 1 / math.sqrt(HEAD_DIM)
     if provider == 'torch':
         fn = lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal)
     if provider == 'original_paper':
@@ -58,8 +59,8 @@ def bench_flash_attention(BATCH, H, SEQ_LEN, HEAD_DIM, causal, mode, provider, d
         fn = lambda: this_tutorial.apply(q, k, v, sm_scale)
     if mode == "bwd":
         O = fn()
-        dO = torch.randn_like(O)
-        fn = lambda: O.backward(dO, retain_graph=True)
+        dLdO = torch.randn_like(O)
+        fn = lambda: O.backward(dLdO, retain_graph=True)
     ms = triton.testing.do_bench(fn)
     flops_per_matmul = 2.0 * BATCH * H * SEQ_LEN * SEQ_LEN * HEAD_DIM
     total_flops = 2 * flops_per_matmul

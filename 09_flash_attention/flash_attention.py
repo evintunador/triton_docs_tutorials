@@ -8,14 +8,13 @@ significantly faster than the pseudocode from the original papers
 https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html#sphx-glr-getting-started-tutorials-06-fused-attention-py
 
 What you'll learn:
+- calling sub-kernels
 - using the faster tl.exp2() instead of tl.exp()
 - Flash attention's specific parallelization strategy
 - tl.static_assert()
 - multi-axis launch grids & the importance of launch grid axis ordering
 - when to pre-compute certain values in a separate kernel
 - using approximate constant values rather than calculating
-
-TODO fp16 to fp32 acc
 """
 
 import torch
@@ -158,8 +157,8 @@ def _attn_fwd_inner(
         )
         for BLOCK_SIZE_QO in [16]#, 32, 64]
         for BLOCK_SIZE_KV in [16]#, 32, 64]
-        for num_stages in [1]#, 3, 5]
-        for num_warps in [2]#, 4, 8]
+        for num_stages in [3]
+        for num_warps in [8]
     ],
     key=["N", "Dh"], # auto-tune will re-run every time either of these values changes in a new input
     # TODO is there a way to make it only change when N surpasses a new multiple of BLOCK_SIZE?
@@ -305,9 +304,9 @@ def attn_fwd(
     [
         triton.Config({"PRE_BLOCK_SIZE_ROW": PRE_BLOCK_SIZE_ROW},
                         num_stages=num_stages, num_warps=num_warps,)
-        for PRE_BLOCK_SIZE_ROW in [32, 64, 128]
-        for num_stages in [1, 3, 5]
-        for num_warps in [2, 4, 8]
+        for PRE_BLOCK_SIZE_ROW in [16]#, 64, 128]
+        for num_stages in [1]#, 5]
+        for num_warps in [4]#, 4, 8]
     ],
     key=["N", "Dh"], # auto-tune will re-run every time either of these values changes in a new input
 )
@@ -501,8 +500,8 @@ def _attn_backward_Q(
                         num_stages=num_stages, num_warps=num_warps,)
         for BLOCK_SIZE_MICRO in [16]#, 32, 64]
         for BLOCK_SIZE_MACRO in [32]#, 64, 128]
-        for num_stages in [1]#, 3, 5, 7]
-        for num_warps in [2]#, 4, 8, 16]
+        for num_stages in [1]#, 3, 5]
+        for num_warps in [2]#, 4, 8]
         if BLOCK_SIZE_MACRO > BLOCK_SIZE_MICRO # could do >= but i wanna get mileage out of the loop code we wrote
     ],
     key=["N", "Dh"], # auto-tune will re-run every time either of these values changes in a new input
