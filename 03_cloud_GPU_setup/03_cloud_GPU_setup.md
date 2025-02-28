@@ -46,5 +46,9 @@ pip install --upgrade torch
 ```
 pip install --upgrade triton
 ```
+11. Once you're done with all changes pushed, make sure to logout so some random GPU provider doesn't have access to your github account
+```
+gh auth logout
+```
 
 *note: if you're on an AMD GPU then this whole process should likely be the same, but throughout the repo you'll have to do your own research on the relatively small edits required to make your code more specifically efficient for your hardware. those edits can be found in the [original official triton docs tutorials](https://triton-lang.org/main/getting-started/tutorials/index.html); i removed them from my version*

@@ -787,8 +787,8 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, mode, provider, dev
 
 
 if __name__ == "__main__":
-    test_op(BATCH_SIZE=4, NUM_HEADS=8, SEQ_LEN=1024, HEAD_DIM=64, causal=True)
-    test_op(BATCH_SIZE=4, NUM_HEADS=8, SEQ_LEN=1024, HEAD_DIM=64, causal=False)
+    test_op(BATCH_SIZE=4, NUM_HEADS=8, SEQ_LEN=1024, HEAD_DIM=256, causal=True)
+    test_op(BATCH_SIZE=4, NUM_HEADS=8, SEQ_LEN=1024, HEAD_DIM=256, causal=False)
     print("PASSED")
 
     # Only run benchmark if explicitly requested
