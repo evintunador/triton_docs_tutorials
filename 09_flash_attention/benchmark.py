@@ -19,15 +19,21 @@ for mode in ["fwd", "bwd"]:
             x_names=["SEQ_LEN"],
             x_vals=[512 * i for i in range(1, 4)], # LOWER IF YOU DON'T HAVE ENOUGH RAM
             line_arg="provider",
-            line_vals=["torch", 'original_paper', 'umar', 'triton_docs', 'this_tutorial'],
+            line_vals=[
+                "torch", 
+                #'original_paper', 
+                #'umar', 
+                #'triton_docs', 
+                'this_tutorial'
+                ],
             line_names=[
                 "torch.nn.functional.scaled_dot_product_attention", 
-                "Original Paper's Psuedocode Replication", 
-                "Umar's Implementation", 
-                "Official Triton Docs Implementation",
+                #"Original Paper's Psuedocode Replication", 
+                #"Umar's Implementation", 
+                #"Official Triton Docs Implementation",
                 "This tutorial's optimized implementation"
                 ],
-            styles=[("red", "-"), ("blue", "-"), ("green", "-"), ("purple", "-"), ("pink", "-")],
+            styles=[("red", "-"), ("blue", "-")],#, ("green", "-"), ("purple", "-"), ("pink", "-")],
             ylabel="TFLOPS",
             plot_name=f"attention-performance-{mode}",
             args={

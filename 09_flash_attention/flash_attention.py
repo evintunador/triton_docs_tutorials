@@ -156,10 +156,10 @@ def _attn_fwd_inner(
             {"BLOCK_SIZE_QO": BLOCK_SIZE_QO, "BLOCK_SIZE_KV": BLOCK_SIZE_KV},
             num_stages=num_stages, num_warps=num_warps,
         )
-        for BLOCK_SIZE_QO in [64]#, 128]
-        for BLOCK_SIZE_KV in [32]#, 64]
-        for num_stages in [3]#, 4, 7]
-        for num_warps in [2]#, 4]
+        for BLOCK_SIZE_QO in [32, 64, 128]
+        for BLOCK_SIZE_KV in [32, 64, 128]
+        for num_stages in [3, 4, 7]
+        for num_warps in [2, 4, 8, 16]
     ],
     key=["N", "Dh"], # auto-tune will re-run every time either of these values changes in a new input
     # TODO is there a way to make it only change when N surpasses a new multiple of BLOCK_SIZE?
@@ -305,9 +305,9 @@ def attn_fwd(
     [
         triton.Config({"PRE_BLOCK_SIZE_ROW": PRE_BLOCK_SIZE_ROW},
                         num_stages=num_stages, num_warps=num_warps,)
-        for PRE_BLOCK_SIZE_ROW in [32]#, 64, 128]
-        for num_stages in [1]#, 3, 5]
-        for num_warps in [2]#, 4, 8]
+        for PRE_BLOCK_SIZE_ROW in [32, 64, 128, 256]
+        for num_stages in [1, 3, 5, 7]
+        for num_warps in [2, 4, 8, 16]
     ],
     key=["N", "Dh"], # auto-tune will re-run every time either of these values changes in a new input
 )
@@ -501,10 +501,10 @@ def _attn_backward_Q(
     [
         triton.Config({"BLOCK_SIZE_MACRO": BLOCK_SIZE_MACRO, "BLOCK_SIZE_MICRO": BLOCK_SIZE_MICRO},
                         num_stages=num_stages, num_warps=num_warps,)
-        for BLOCK_SIZE_MICRO in [16]#, 32, 64]
-        for BLOCK_SIZE_MACRO in [32]#, 64, 128]
-        for num_stages in [1]#, 3, 5, 7]
-        for num_warps in [2]#, 4, 8, 16]
+        for BLOCK_SIZE_MICRO in [16, 32, 64]
+        for BLOCK_SIZE_MACRO in [32, 64, 128]
+        for num_stages in [1, 3, 5, 7]
+        for num_warps in [2, 4, 8, 16]
         if BLOCK_SIZE_MACRO > BLOCK_SIZE_MICRO # could do >= but i wanna get mileage out of the loop code we wrote
     ],
     key=["N", "Dh"], # auto-tune will re-run every time either of these values changes in a new input
@@ -686,8 +686,8 @@ class _flashattention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, scale): 
         assert q.shape == k.shape == v.shape
-        assert q.shape[-1] in (32, 64, 128, 256), \
-            f'flash attention only supports head dimension of 32, 64, 128 or 256 but got {q.shape[-1]}'
+        assert q.shape[-1] <= 128, \
+            f'flash attention only supports head dimension of 128 less but got {q.shape[-1]}'
             # the kernel actually isn't this limited but too much larger and i think it might overwhelm SRAM
         B, H, N, Dh = q.shape
         assert q.device == k.device and q.device == v.device
@@ -734,8 +734,6 @@ class _flashattention(torch.autograd.Function):
 
         dLdO = dLdO.contiguous()
         assert q.stride() == k.stride() == v.stride() == O.stride() == dLdO.stride()
-        
-        print("preprocess start")
 
         Delta = torch.empty_like(LSE) # shape (B, H, N) fp32
         # the ordering of your grid matters because it determines which programs end up sharing the same SRAM
@@ -750,8 +748,6 @@ class _flashattention(torch.autograd.Function):
             N, Dh,
         )
 
-        print("preprocess end, primary start")
-
         grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE_MACRO"]), B * H) 
         attn_backward[grid](
             q, k, v,
@@ -761,8 +757,6 @@ class _flashattention(torch.autograd.Function):
             q.stride(0), q.stride(1), q.stride(2), q.stride(3), # all tensors should share same stride
             H, N, Dh,
         )
-
-        print("primary end")
 
         return dLdq, dLdk, dLdv, None
 
@@ -824,6 +818,5 @@ if __name__ == "__main__":
     test_flashattention_kernel(1, 1, 256, 32) # without block masking
     test_flashattention_kernel(1, 1, 256, 64) # without block masking
     test_flashattention_kernel(1, 1, 256, 128) # without block masking
-    test_flashattention_kernel(1, 1, 256, 256) # without block masking
-    test_flashattention_kernel(32, 8, 512, 256) # without block masking
-    test_flashattention_kernel(32, 8, 511, 256) # with block masking
+    test_flashattention_kernel(32, 8, 512, 128) # without block masking
+    test_flashattention_kernel(32, 8, 420, 128) # with block masking
