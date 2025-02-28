@@ -94,7 +94,8 @@ def _layernorm_forward(
 @triton.jit
 def _layernorm_backward_dLdx(
     x_ptr, dLdx_ptr, dLdy_ptr,                              # pointers to first entries of tensors of shape (M, N)
-    w_ptr, _dLdw_ptr, _dLdb_ptr,                            # pointers to first entries of tensors of shape (N)
+    w_ptr,                                                  # pointers to first entries of tensors of shape (N)
+    dLdw_intermediate_ptr, dLdb_intermediate_ptr,           # pointers to first entries of tensors of shape (GROUP_SIZE, N)
     mean_ptr, rstd_ptr,                                     # pointers to first entries of tensors of shape (M)
     locks_ptr,                                              # pointers to first entry of tensor of shape (2 * GROUP_SIZE)
     stride, N,                                              # dynamic variables determined at run-time
@@ -136,15 +137,16 @@ def _layernorm_backward_dLdx(
 
     # Here we'll accumulate partial sums for dLdw and dLdb, meaning these are only the single rows of 
     #  the dLdw and dLdb gradients that this PID had the job of calculating
-    _dLdw_row = (dLdy * x_normalized).to(w.dtype)
-    _dLdb_row = (dLdy).to(w.dtype)
+    dLdw_contribution = (dLdy * x_normalized).to(w.dtype)
+    dLdb_contribution = (dLdy).to(w.dtype)
 
     """
-    Now we'd like to take our single portion of dLdw and dLdb and somehow aggregate it with
+    Now we'd like to take our single contributions to dLdw and dLdb and somehow aggregate them with
     the portions that all of the other PIDs have calculated.
     The reason this aggregation has to happen is because the input x is of shape (M, N) while
     the weights and biases are of shape (N), meaning they receive gradients from all M rows of x,
-    and this PID holds the gradient of one of those rows. 
+    and this PID holds the gradient of one of those rows, but it's not easy to communicate
+    that information between PIDs.
     The specific operation to do between all these rows is to sum them up, but we can't just
     naively tl.load(), then add our row, then tl.store() because all of the PIDs would do so
     at slightly different and completely unpredictable times, meaning all the tl.store() calls
@@ -156,33 +158,34 @@ def _layernorm_backward_dLdx(
 
     However, even that's not great because if only one PID can do work at a time and we have a 
     lot of PIDs, then that's a whole lot of time leaving a large majority of the GPU sitting 
-    idle. 
+    idle while they wait in line. 
     What we need then is a way for GROUPS of PIDs to work sequentially with a lock while each
     group works in parallel to the others. 
-    This is why we created _dLdw and _dLdb, each of which has shape (GROUP_SIZE, N).
+    This is why we created dLdw_intermediate and dLdb_intermediate, each of which has shape 
+    (GROUP_SIZE, N).
     We're going to assign every PID to a group, and then use our locking mechanism to ensure
-    that only (N // GROUP_SIZE) PIDs attempt to wait around for their turn to work on a row
-    of _dLdw and _dLdb at a time.
-    In this way we've now gone from a sequential process with N steps to one with 
-    (N // GROUP_SIZE) steps. 
+    that only (M // GROUP_SIZE) PIDs attempt to wait around for their turn to work on a row
+    of dLdw_intermediate and dLdb_intermediate at a time.
+    In this way we've now gone from a sequential process with M steps to one with 
+    (M // GROUP_SIZE) steps. 
     Then in the next kernel we'll take these (GROUP_SIZE, N) matrices and reduce them further
-    down to the desired shape (N) matrices of dLdb.
+    down to the desired shape (N) matrices of dLdw and dLdb.
 
     But how do locks actually work?
     In this case we've got a tensor of shape (2 * GROUP_SIZE) and datatype int32 that's
     initialized to all zeroes. 
     The first GROUP_SIZE entries are for holding an indicator of the state of that lock;
-    0 means unlocked and 1 means locked for the row of _dLdw and dLdb that it matches
-    up to.
+    0 means unlocked and 1 means locked for the row of dLdw_intermediate and dLdb_intermediate 
+    that it corresponds to.
     The latter GROUP_SIZE entries are for holding an indicator of whether this lock has
     ever been used before, which is useful because we'll want to run different code if
-    this PID happens to be the first one to add its values to _dLdw and _dLdb.
+    this PID happens to be the first one to add its values to dLdw_intermediate and dLdb_intermediate.
     To use the lock, we check if the entry corresponding to the group that our PID is
     in is locked or unlocked:
     - if it's locked, then we wait and check again in a moment until it's unlocked
-    - if it's unlocked then lock it, load the current value of our group's row of _dLdw and
-        _dLdb, add our _dLdw_row and _dLdb_row respectively, write those new values back
-        to DRAM, and finally unlock it
+    - if it's unlocked then we'll lock it, load the current value of our group's row of 
+        dLdw_intermediate and dLdb_intermediate, add our dLdw_contribution and dLdb_contribution 
+        respectively, write those new values back to DRAM, and finally unlock it
     """
     # To start we figure out which lock ID corresponds to our PID and move our pointers accordingly
     lock_id = PID % GROUP_SIZE # so there are GROUP_SIZE number of locks
@@ -190,13 +193,13 @@ def _layernorm_backward_dLdx(
     locks_ptr += lock_id
     # the next GROUP_SIZE entries hold the count of how many accumulations have already happened on that lock
     count_ptr = locks_ptr + GROUP_SIZE
-    # then we figre out which row of _dLdw and _dLdb we're meant to point to
-    _dLdw_ptrs = _dLdw_ptr + lock_id * N + cols 
-    _dLdb_ptrs = _dLdb_ptr + lock_id * N + cols 
-        # we can use N in place of a .stride() here since these tensors are generated specifically for this purpose 
-        #  and therefore guaranteed to be contiguous in memory
+    # then we figre out which row of dLdw_intermediate and dLdb_intermediate we're meant to point to
+    dLdw_intermediate_ptrs = dLdw_intermediate_ptr + lock_id * N + cols 
+    dLdb_intermediate_ptrs = dLdb_intermediate_ptr + lock_id * N + cols 
+        # we can use N in place of a .stride() here since these tensors are generated specifically for 
+        #  this purpose and therefore guaranteed to be contiguous in memory
     
-    # .atomic_cas() compares the contents of a memory location with a given value and, 
+    # atomic_cas() compares the contents of a memory location with a given value and, 
     #  only if they are the same, modifies the contents of that memory location to a new given value.
     while tl.atomic_cas(locks_ptr, 0, 1) == 1:
         pass
@@ -207,18 +210,19 @@ def _layernorm_backward_dLdx(
     # then here we grab the number of times this lock position has already been accumulated into
     count = tl.load(count_ptr) # shape (1)
     if count == 0: # if this PID is the first one to access the lock
-        # then no need to do flops; we can just set the row of _dLdw & _dLdB equal to _dLdw_row and _dLdb_row
-        # .atomic_xchg() sets the value at Count_ptr equal to 1 so the next PID knows we've been here
+        # then no need to do the memory reads & flops; we can just set the row of dLdw_intermediate & 
+        #  dLdB_intermediate equal to dLdw_contribution and dLdb_contribution (done below, outside the if/else)
+        # atomic_xchg() sets the value at Count_ptr equal to 1 so the next PID knows we've been here
         tl.atomic_xchg(count_ptr, 1)
     else: # but if this is not the first pid in the accumulation process,
         # then we've actually gotta accumulate by grabbing the values already there in 
-        #  DRAM and adding them to the rows of _dLdw and dLdb that our PID generated
-        _dLdw_row += tl.load(_dLdw_ptrs, mask=mask) # we load and add in one step (+= operator)
-        _dLdb_row += tl.load(_dLdb_ptrs, mask=mask) #  so as not to consume unnecessary SRAM
+        #  DRAM and adding them to the rows of dLdw_contribution and dLdb_contribution that our PID generated
+        dLdw_contribution += tl.load(dLdw_intermediate_ptrs, mask=mask) # we load and add in one step (+= operator)
+        dLdb_contribution += tl.load(dLdb_intermediate_ptrs, mask=mask) #  so as not to consume unnecessary SRAM
     
     # now we get to store our accumulated values back to DRAM
-    tl.store(_dLdw_ptrs, _dLdw_row, mask=mask)
-    tl.store(_dLdb_ptrs, _dLdb_row, mask=mask)
+    tl.store(dLdw_intermediate_ptrs, dLdw_contribution, mask=mask)
+    tl.store(dLdb_intermediate_ptrs, dLdb_contribution, mask=mask)
 
     # and finally release the lock so that any pids waiting in their while loop can take their turn
     tl.atomic_xchg(locks_ptr, 0) # we set the value at our lock equal to 0
@@ -226,8 +230,8 @@ def _layernorm_backward_dLdx(
 
 @triton.jit
 def _layernorm_backward_dLdw_dLdb(
-    _dLdw_ptr,  _dLdb_ptr, 
-    dLdw_ptr, dLdb_ptr,
+    dLdw_intermediate_ptr,  dLdb_intermediate_ptr, # pointers to first entries of tensors of shape (GROUP_SIZE, N)
+    dLdw_ptr, dLdb_ptr,                            # pointers to first entries of tensors of shape (N)
     GROUP_SIZE,  N,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
 ):
@@ -246,8 +250,8 @@ def _layernorm_backward_dLdw_dLdb(
         offsets = row_ptrs[:, None] * N + col_ptrs[None, :]
 
         # load the partial sums from all that group locking nonsense earlier and add them to our final output
-        dLdw_acc += tl.load(_dLdw_ptr + offsets, mask=mask, other=0.) 
-        dLdb_acc += tl.load(_dLdb_ptr + offsets, mask=mask, other=0.)
+        dLdw_acc += tl.load(dLdw_intermediate_ptr + offsets, mask=mask, other=0.) 
+        dLdb_acc += tl.load(dLdb_intermediate_ptr + offsets, mask=mask, other=0.)
             # masked-out values get set to 0 so they don't affect sum
 
     # sum along our BLOCK_SIZE_M dimension to get the final BLOCK_SIZE_N chunk of dLdw & dLdb that this 
@@ -338,7 +342,7 @@ class LayerNorm(torch.autograd.Function):
         M, N = x.reshape(-1, x.shape[-1]).shape
 
         # allocate gradients of original inputs
-        dLdw = torch.empty((N, ), dtype=w.dtype, device=w.device) # the non-'_' versions are final gradients
+        dLdw = torch.empty((N, ), dtype=w.dtype, device=w.device)
         dLdb = torch.empty((N, ), dtype=w.dtype, device=w.device)
         dLdx = torch.empty_like(dLdy)
 
@@ -350,8 +354,8 @@ class LayerNorm(torch.autograd.Function):
 
         # Rather than computing all three gradients immediately in one kernel, we're actually going to call two kernels.
         # The first will compute dLdx and intermediary steps on the way to dLdw and dLdb; we'll call these _dLdw and _dLdb
-        _dLdw = torch.zeros((GROUP_SIZE, N), dtype=x.dtype, device=w.device)
-        _dLdb = torch.zeros((GROUP_SIZE, N), dtype=x.dtype, device=w.device)
+        dLdw_intermediate = torch.zeros((GROUP_SIZE, N), dtype=x.dtype, device=w.device)
+        dLdb_intermediate = torch.zeros((GROUP_SIZE, N), dtype=x.dtype, device=w.device)
 
         # When multiple programs want to edit the same entries in a tensor stored in DRAM, we need a way to prevent them from
         #  doing so out of order and from overwriting each other's work. For that we can use a lock, which is another tensor 
@@ -363,19 +367,23 @@ class LayerNorm(torch.autograd.Function):
             # the second will keep track of whether the lock has been used before, since in the kernel we will need to 
             #  treat the first use differently from all successive uses
         
-        # enqueue kernel that uses forward pass heuristics to calculate both dLdx and the partial sums of dLdw and dLdb
+        # enqueue kernel that uses forward pass heuristics to calculate both dLdx and the partial contributions to dLdw and dLdb
         _layernorm_backward_dLdx[(M, )](  # parallelize across rows
-            x, dLdx, dLdy, w, _dLdw, _dLdb, mean, rstd, locks,  # all of our tensors that'll get turned into pointers
+            x, dLdx, dLdy, 
+            w, dLdw_intermediate, dLdb_intermediate, 
+            mean, rstd, 
+            locks,  
             x.stride(0), N,  # dynamic run-time variables
             GROUP_SIZE = GROUP_SIZE, BLOCK_SIZE_N = ctx.BLOCK_SIZE, num_warps = ctx.num_warps) # static compile-time variables
         
-        # Now we'll do a seperate call to the second kernel, who's job is to accumulate _dLdw into dLdw and _dLdb into dLdb.
+        # Now we'll do a seperate call to the second kernel, who's job is to accumulate dLdw_intermediate into dLdw and 
+        #  dLdb_intermediate into dLdb.
         # We do this in a separate kernel since this final set of operations requires 
-        #  1) fewer pids (potentially as few as 1 if BLOCK_SIZE_N > N), as opposed to the previous kernel which called M pids
-        #  and 2) _dLdw and _dLdb to be completed before it can begin
+        #  1) fewer pids as opposed to the previous kernel which called M pids
+        #  and 2) dLdw_intermediate and dLdb_intermediate to be completed before it can begin
         grid = lambda meta: [triton.cdiv(N, meta['BLOCK_SIZE_N'])] # parallelize within rows
         _layernorm_backward_dLdw_dLdb[grid](
-            _dLdw, _dLdb, dLdw, dLdb, # intermediary and final tensors
+            dLdw_intermediate, dLdb_intermediate, dLdw, dLdb, 
             min(GROUP_SIZE, M), N,  # run-time integer values
             BLOCK_SIZE_M=32, BLOCK_SIZE_N=128, # heuristically chosen compile-time values
         )
