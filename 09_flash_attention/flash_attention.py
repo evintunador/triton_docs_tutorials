@@ -15,6 +15,7 @@ What you'll learn:
 - multi-axis launch grids & the importance of launch grid axis ordering
 - when to pre-compute certain values in a separate kernel
 - using approximate constant values rather than calculating
+- high precision accumulation & SRAM management
 """
 
 import torch
@@ -23,6 +24,9 @@ import triton.language as tl
 import math
 
 DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
+
+#import os
+#os.environ["TRITON_INTERPRET"] = "1"
 
 @triton.jit
 def _attn_fwd_inner(
