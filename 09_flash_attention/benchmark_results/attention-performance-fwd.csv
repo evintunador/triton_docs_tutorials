@@ -1,4 +1,0 @@
-SEQ_LEN,torch.nn.functional.scaled_dot_product_attention,This tutorial's optimized implementation
-512.000000,27.179473,23.283552
-1024.000000,36.692605,31.104121
-1536.000000,38.344307,33.809694

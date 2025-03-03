@@ -3,6 +3,8 @@ making the [official triton documentation tutorials](https://triton-lang.org/mai
 
 [![ERROR DISPLAYING IMAGE, CLICK HERE FOR VIDEO](https://img.youtube.com/vi/TUQAyCNxFe4/0.jpg)](https://youtube.com/playlist?list=PLPefVKO3tDxOJLAmCA75uShbe1z_RNqkQ&si=C5VF9fNW8CYZzh9x)
 
+*Note:* the flash attention tutorial is only 99.9% finished, and I only plan on finishing it if people actually start watching the videos. All you'd have to do to "finish" it is fix the current bug which definitely stems from data types not matching up to whatever PyTorch does internally, meaning mess with the `.to(tl.float16)`'s in the attention forward pass
+
 ## learning resources I used
 - of course the [official Triton documentation](https://triton-lang.org/main/getting-started/tutorials/index.html)
 - [here](https://github.com/hkproj/triton-flash-attention)'s a flash-attention implementation by one of my fav youtubers that comes with an [8 hour video](https://www.youtube.com/watch?v=zy8ChVd_oTM&t=1s)

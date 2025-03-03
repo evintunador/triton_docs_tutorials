@@ -102,7 +102,7 @@ def _attn_fwd_inner(
             # the causal mask is True on the lower-triangular including the diagonal
             causal_mask = offsets_QO_N[:, None] >= (offsets_KV_N[None, :])
             # causal mask addition sets upper-triangular values (excluding diagonal) to -inf
-            S += tl.where(causal_mask, 0, -1.0e6) # shape (BLOCK_SIZE_QO, BLOCK_SIZE_KV)
+            S += tl.where(causal_mask, 0, -1.0e6) # shape (BLOCK_SIZE_QO, BLOCK_SIZE_KV) fp32
         # notice that the masked out tokens previously hugging the right edge of S have mostly been replaced with -inf
         #  and the masked out tokens hugging the bottom edge are still mostly 0's but with some -infs towards the
         #  right edge of each of them, except for the last one which is only 0's
@@ -144,7 +144,8 @@ def _attn_fwd_inner(
             #  rows of V. This matmul leaves O with a bunch of incorrect values in its bottom rows, but they
             #  will get ignored later when we store O with a proper mask
 
-        M = M_new # sets old max equal to new max, ready to be used by next iteration of for loop
+        # sets old max equal to new max, ready to be used by next iteration of for loop
+        M = M_new # fp32
 
         # iterate pointers
         K_T_offsets += BLOCK_SIZE_KV * stride_K_N
@@ -160,13 +161,12 @@ def _attn_fwd_inner(
             {"BLOCK_SIZE_QO": BLOCK_SIZE_QO, "BLOCK_SIZE_KV": BLOCK_SIZE_KV},
             num_stages=num_stages, num_warps=num_warps,
         )
-        for BLOCK_SIZE_QO in [32, 64, 128]
-        for BLOCK_SIZE_KV in [32, 64, 128]
-        for num_stages in [3, 4, 7]
-        for num_warps in [2, 4, 8, 16]
+        for BLOCK_SIZE_QO in [16, 32, 64, 128]
+        for BLOCK_SIZE_KV in [16, 32, 64, 128]
+        for num_stages in [3, 5, 7]
+        for num_warps in [4, 8, 16]
     ],
-    key=["N", "Dh"], # auto-tune will re-run every time either of these values changes in a new input
-    # TODO is there a way to make it only change when N surpasses a new multiple of BLOCK_SIZE?
+    key=["Dh"],
 )
 @triton.jit
 def attn_fwd(
@@ -310,10 +310,10 @@ def attn_fwd(
         triton.Config({"PRE_BLOCK_SIZE_ROW": PRE_BLOCK_SIZE_ROW},
                         num_stages=num_stages, num_warps=num_warps,)
         for PRE_BLOCK_SIZE_ROW in [32, 64, 128, 256]
-        for num_stages in [1, 3, 5, 7]
-        for num_warps in [2, 4, 8, 16]
+        for num_stages in [3, 5, 7]
+        for num_warps in [4, 8, 16]
     ],
-    key=["N", "Dh"], # auto-tune will re-run every time either of these values changes in a new input
+    key=["Dh"],
 )
 @triton.jit
 def attn_backward_preprocess(
@@ -411,15 +411,15 @@ def _attn_backward_KV(
             # implement a lower-triangular mask. it looks like upper-triangular because we've 
             #  transposed, which is also the reason why our columns & rows are reversed
             mask = (offsets_COL[:, None] <= offsets_ROW[None, :]) # (BLOCK_SIZE_COL, BLOCK_SIZE_ROW)
-            P_T = tl.where(mask, P_T, 0.)
+            P_T = tl.where(mask, P_T, 0.).to(tl.float16) # tl.where() converts to fp32
 
         # compute dLdV
         dLdV = tl.dot(P_T, dLdO, acc=dLdV) # shape (BLOCK_SIZE_COL, Dh) fp16
 
         # compute dLdP_T and dLdS_T to get dLdK
         dLdP_T = tl.dot(V, tl.trans(dLdO)) # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW) fp16
-        dLdS_T = P_T * (dLdP_T - Delta[None, :]) * ln2 # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW) fp32
-        dLdK = tl.dot(dLdS_T.to(tl.float16), tl.trans(Q_T), acc=dLdK) # shape (BLOCK_SIZE_COL, D) fp16
+        dLdS_T = (P_T * (dLdP_T - Delta[None, :]) * ln2).to(tl.float16) # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW) fp16
+        dLdK = tl.dot(dLdS_T, tl.trans(Q_T), acc=dLdK) # shape (BLOCK_SIZE_COL, D) fp16
             # acc tells the tl.dot to accumulate into dLdK
 
         # increment pointers
@@ -484,12 +484,12 @@ def _attn_backward_Q(
 
         # calc dLdP and dLdS to get dLdQ
         dLdP = tl.dot(dLdO, V_T) # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL) fp16
-        dLdS = P * (dLdP - Delta[:, None]) * ln2 # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL) fp32
+        dLdS = (P * (dLdP - Delta[:, None]) * ln2).to(tl.float16) # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
             # ^this line is equivalent to:
             #weighted_dLdP = tl.sum(dLdP * P, axis=1)  # row-sum over keys
             #dLdS = P * (dLdP - weighted_dLdP[:, None])
             # but trades-off a memory access for a binary & then a reduction op
-        dLdQ += tl.dot(dLdS.to(tl.float16), tl.trans(K_T)) # shape (BLOCK_SIZE_ROW, Dh) fp16
+        dLdQ += tl.dot(dLdS, tl.trans(K_T)) # shape (BLOCK_SIZE_ROW, Dh) fp16
             # we'll need to de-sdcale dLdQ in the end because K_T was pre-scaled
             # we do it later instead of now bc now would mean num_steps * flops versus just flops
         
@@ -507,12 +507,11 @@ def _attn_backward_Q(
                         num_stages=num_stages, num_warps=num_warps,)
         for BLOCK_SIZE_MICRO in [16, 32, 64]
         for BLOCK_SIZE_MACRO in [32, 64, 128]
-        for num_stages in [1, 3, 5, 7]
-        for num_warps in [2, 4, 8, 16]
+        for num_stages in [3, 5, 7]
+        for num_warps in [4, 8, 16]
         if BLOCK_SIZE_MACRO > BLOCK_SIZE_MICRO # could do >= but i wanna get mileage out of the loop code we wrote
     ],
-    key=["N", "Dh"], # auto-tune will re-run every time either of these values changes in a new input
-    # TODO is there a way to make it only change when N surpasses a new multiple of BLOCK_SIZE?
+    key=["Dh"],
 )
 @triton.jit
 def attn_backward(
@@ -581,9 +580,8 @@ def attn_backward(
     #  num_steps times inside _attn_backward_KV
     # we also scale by rln2 to account for the derivative of tl.exp2() and do it
     #  here instead of inside _attn_backward_KV for the same reason
-    K *= scale * rln2
-        # this multiplication also turns K into fp32. don't ask me why
-    K = K.to(tl.float16)
+    K = (K * (scale * rln2)).to(tl.float16)
+        # the multiplication also turns K into fp32. don't ask me why
 
     # we'll accumulate the gradients into these
     dLdK = tl.zeros([BLOCK_SIZE_COL_1, Dh], dtype=tl.float32)
@@ -647,8 +645,7 @@ def attn_backward(
     QO_offsets = offsets_ROW[:, None] * stride_N + offsets_Dh[None, :] * stride_Dh
     mask_ROW = offsets_ROW < N
     Q = tl.load(Q_ptr + QO_offsets, mask=mask_ROW[:, None], other=0.) # shape (BLOCK_SIZE_ROW_2, Dh) fp16
-    Q *= scale * rln2 # changes to fp32
-    Q = Q.to(tl.float16)
+    Q = (Q * (scale * rln2)).to(tl.float16) # the multiplication by the float changes Q to fp32
     dLdO = tl.load(dLdO_ptr + QO_offsets, mask=mask_ROW[:, None], other=0.) # shape (BLOCK_SIZE_ROW_2, Dh) fp16
     LSE = tl.load(LSE_ptr + offsets_ROW, mask=mask_ROW, other=0.)[:, None] # shape (BLOCK_SIZE_ROW_2, 1) fp32
 
@@ -681,8 +678,8 @@ def attn_backward(
         scale, ln2, rln2,
         MASK=False
     )
-    dLdQ *= scale * rln2 # multiplication by scalar converts to fp32
-    tl.store(dLdQ_ptr + QO_offsets, dLdQ.to(tl.float16), mask=mask_ROW[:, None])
+    dLdQ = (dLdQ * (scale * rln2)).to(tl.float16) # multiplication by scalar converts to fp32
+    tl.store(dLdQ_ptr + QO_offsets, dLdQ, mask=mask_ROW[:, None])
 
 
 class _flashattention(torch.autograd.Function):
@@ -817,10 +814,59 @@ def test_flashattention_kernel(B, H, N, Dh, device=DEVICE):
     print("Passed bwd")
     
 
+
+# vary seq length for fixed head and batch=4
+configs = []
+for mode in ["fwd", "bwd"]:
+    configs.append(
+        triton.testing.Benchmark(
+            x_names=["SEQ_LEN"],
+            x_vals=[512 * i for i in range(1, 17)], # LOWER IF YOU DON'T HAVE ENOUGH RAM
+            line_arg="provider",
+            line_vals=["torch", 'this_tutorial'],
+            line_names=[
+                "torch.nn.functional.scaled_dot_product_attention", 
+                "This tutorial's implementation"
+                ],
+            styles=[("red", "-"), ("blue", "-")],
+            ylabel="TFLOPS",
+            plot_name=f"attention-performance-{mode}",
+            args={"mode": mode},
+        ))
+
+@triton.testing.perf_report(configs)
+def bench_flash_attention(SEQ_LEN, mode, provider, device=DEVICE):
+    assert mode in ["fwd", "bwd"]
+    dtype = torch.float16
+    BATCH, N_HEADS = 32, 4 # LOWER THESE IF YOU DON'T HAVE ENOUGH RAM
+    HEAD_DIM = 128 # AND THIS IF YOU DON"T HAVE ENOUGH SRAM
+    q = torch.randn((BATCH, H, SEQ_LEN, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    k = torch.randn((BATCH, H, SEQ_LEN, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    v = torch.randn((BATCH, H, SEQ_LEN, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    sm_scale = 1 / math.sqrt(HEAD_DIM)
+    if provider == 'torch':
+        fn = lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+    if provider == 'this_tutorial':
+        fn = lambda: this_tutorial.apply(q, k, v, sm_scale)
+    if mode == "bwd":
+        O = fn()
+        dLdO = torch.randn_like(O)
+        fn = lambda: O.backward(dLdO, retain_graph=True)
+    ms = triton.testing.do_bench(fn)
+    flops_per_matmul = 2.0 * BATCH * H * SEQ_LEN * SEQ_LEN * HEAD_DIM
+    total_flops = 2 * flops_per_matmul * 0.5
+    if mode == "bwd":
+        total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
+    return total_flops * 1e-12 / (ms * 1e-3)
+
 if __name__ == "__main__":
     # always run unit-tests
-    test_flashattention_kernel(1, 1, 256, 32) # without block masking
-    test_flashattention_kernel(1, 1, 256, 64) # without block masking
-    test_flashattention_kernel(1, 1, 256, 128) # without block masking
-    test_flashattention_kernel(32, 8, 512, 128) # without block masking
-    test_flashattention_kernel(32, 8, 420, 128) # with block masking
+    test_flashattention_kernel(1, 1, 128, 32) # without block masking
+    test_flashattention_kernel(1, 1, 128, 64) # without block masking
+    test_flashattention_kernel(1, 1, 128, 128) # without block masking
+    test_flashattention_kernel(32, 8, 69, 128) # with block masking
+
+    # Only run benchmark if explicitly requested
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--benchmark":
+        bench_flash_attention.run(save_path='.', print_data=True)
