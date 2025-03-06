@@ -15,7 +15,14 @@ What you'll learn:
 - multi-axis launch grids & the importance of launch grid axis ordering
 - when to pre-compute certain values in a separate kernel
 - using approximate constant values rather than calculating
-- high precision accumulation & SRAM management
+
+Notable features this kernel does NOT include:
+- suppport for datatypes other than fp32 and mixed precision
+- dropout
+- likely more I'm forgetting
+
+Also note, the benchmarking is setup but not used (lists have single entries)
+So if you wanted even better performance you could re-enable autotuning
 """
 
 import torch
@@ -93,50 +100,50 @@ def _attn_fwd_inner(
 
         # compute (Q @ K^T) / sqrt(Dh)
         mask_KV_N = offsets_KV_N < N
-        K_T = tl.load(K_ptr + K_T_offsets, mask=mask_KV_N[None, :], other=0.) # shape (Dh, BLOCK_SIZE_KV) fp16
+        K_T = tl.load(K_ptr + K_T_offsets, mask=mask_KV_N[None, :], other=0.) # shape (Dh, BLOCK_SIZE_KV)
             # sequence mask sets non-existent tokens in the block past N to zero vectors
-        S = tl.dot(Q, K_T) * softmax_scale # shape (BLOCK_SIZE_QO, BLOCK_SIZE_KV) fp32
+        S = tl.dot(Q, K_T) * softmax_scale # shape (BLOCK_SIZE_QO, BLOCK_SIZE_KV)
             # the masked tokens create columns & rows of zeros hugging the bottom and right edges of S
 
         if DIAGONAL: # if we're currently on a block containing the diagonal
             # the causal mask is True on the lower-triangular including the diagonal
             causal_mask = offsets_QO_N[:, None] >= (offsets_KV_N[None, :])
             # causal mask addition sets upper-triangular values (excluding diagonal) to -inf
-            S += tl.where(causal_mask, 0, -1.0e6) # shape (BLOCK_SIZE_QO, BLOCK_SIZE_KV) fp32
+            S += tl.where(causal_mask, 0, -1.0e6) # shape (BLOCK_SIZE_QO, BLOCK_SIZE_KV)
         # notice that the masked out tokens previously hugging the right edge of S have mostly been replaced with -inf
         #  and the masked out tokens hugging the bottom edge are still mostly 0's but with some -infs towards the
         #  right edge of each of them, except for the last one which is only 0's
         
         # find the max values of the new block and compare them to those of all previous blocks to get an update
-        M_new = tl.maximum(M, tl.max(S, axis=1)) # shape is (BLOCK_SIZE_QO) fp32
+        M_new = tl.maximum(M, tl.max(S, axis=1)) # shape is (BLOCK_SIZE_QO)
             # masked token rows at the bottom will return a maximum value of 0 since their only values are 0 and -inf
         # adjust S block for safe softmax
-        S -= M_new[:, None] # shape (BLOCK_SIZE_QO, BLOCK_SIZE_KV) fp32
+        S -= M_new[:, None] # shape (BLOCK_SIZE_QO, BLOCK_SIZE_KV)
             # in the case of masked non-existent tokens that means subtracting by 0 so no difference
 
         # Compute the exponential of each safe dot product, which will be the numerator of our softmax
-        P = tl.exp2(S) # shape (BLOCK_SIZE_QO, BLOCK_SIZE_KV) fp32
+        P = tl.exp2(S) # shape (BLOCK_SIZE_QO, BLOCK_SIZE_KV)
             # we're using base 2 instead of base e because it's faster and softmax is invariant to the change,
             #  however it does make the derivative in the backward pass a bit more complicated.
             # for the masked non-existent tokens as the bottom that will be 2^0=1 for all those entries
         
         # Compute the sum by rows of the attention scores
-        L_new = tl.sum(P, axis=1) # shape (BLOCK_SIZE_QO) fp32
+        L_new = tl.sum(P, axis=1) # shape (BLOCK_SIZE_QO)
             # for the masked non-existent tokens we're summing a bunch of 1's with some -infs, except for the
             #  very bottom one which is just 1's and therefore its sum is the largest being equal to BLOCK_SIZE_QO
         # This alpha is the correction factor we'll use on the previous L
-        alpha = tl.exp2(M - M_new) # shape (BLOCK_SIZE_Q) fp32
+        alpha = tl.exp2(M - M_new) # shape (BLOCK_SIZE_Q)
             # for the masked non-existent tokens that's just 2^(1-1)=2^0=1=alpha_i so no correction
         # Apply the correction factor to the previous L and add the new L
-        L = L * alpha + L_new # shape (BLOCK_SIZE_QO) fp32
+        L = L * alpha + L_new # shape (BLOCK_SIZE_QO)
             # for each of the masked non-existent tokens they approach N for their entry L_i
 
         # This computes O = P @ V + O * alpha
-        V = tl.load(V_ptr + V_offsets, mask=mask_KV_N[:, None], other=0.) # shape (BLOCK_SIZE_KV, Dh) fp16
+        V = tl.load(V_ptr + V_offsets, mask=mask_KV_N[:, None], other=0.) # shape (BLOCK_SIZE_KV, Dh)
         # adjusts previous values based on potential new max
-        O = O * alpha[:, None] # shape (BLOCK_SIZE_QO, Dh) fp32
+        O = O * alpha[:, None] # shape (BLOCK_SIZE_QO, Dh)
         # accumulated P and V block dot product into O
-        O = tl.dot(P.to(tl.float16), V, acc=O) # shape (BLOCK_SIZE_QO, Dh) fp32
+        O = tl.dot(P, V, acc=O) # shape (BLOCK_SIZE_QO, Dh)
             # notice we're doing this V projection before we've actually divided by our softmax denominator l_i
             #  which is possible because in this context the two operations are associative
             # acc tells triton to accumulate the values into O_block
@@ -145,7 +152,7 @@ def _attn_fwd_inner(
             #  will get ignored later when we store O with a proper mask
 
         # sets old max equal to new max, ready to be used by next iteration of for loop
-        M = M_new # fp32
+        M = M_new
 
         # iterate pointers
         K_T_offsets += BLOCK_SIZE_KV * stride_K_N
@@ -161,10 +168,10 @@ def _attn_fwd_inner(
             {"BLOCK_SIZE_QO": BLOCK_SIZE_QO, "BLOCK_SIZE_KV": BLOCK_SIZE_KV},
             num_stages=num_stages, num_warps=num_warps,
         )
-        for BLOCK_SIZE_QO in [16, 32, 64, 128]
-        for BLOCK_SIZE_KV in [16, 32, 64, 128]
-        for num_stages in [3, 5, 7]
-        for num_warps in [4, 8, 16]
+        for BLOCK_SIZE_QO in [16]#, 32, 64, 128]
+        for BLOCK_SIZE_KV in [16]#, 32, 64, 128]
+        for num_stages in [3]#, 5, 7]
+        for num_warps in [4]#, 8, 16]
     ],
     key=["Dh"],
 )
@@ -234,7 +241,7 @@ def attn_fwd(
 
     # load the block of Q that this PID will use; it will stay in SRAM throughout the inner loop
     mask_QO_N = offsets_QO_N < N
-    Q = tl.load(Q_ptr + Q_offsets, mask=mask_QO_N[:, None], other=0.) # shape (BLOCK_SIZE_QO, Dh) fp16
+    Q = tl.load(Q_ptr + Q_offsets, mask=mask_QO_N[:, None], other=0.) # shape (BLOCK_SIZE_QO, Dh)
         # sequence mask sets non-existent tokens in the block past N to zero vectors
 
     ## pre-allocate tensors for storing intermediate & output values
@@ -276,7 +283,7 @@ def attn_fwd(
     
     # finally dividing by the denominator of our softmax.
     # notice we've already multiplied by V to get O, so this was done out-of-order from naive softmax implementations
-    O = O / L[:, None] # shapes (BLOCK_SIZE_QO, Dh) / (BLOCK_SIZE_QO, 1) = (BLOCK_SIZE_QO, Dh) fp32
+    O = O / L[:, None] # shapes (BLOCK_SIZE_QO, Dh) / (BLOCK_SIZE_QO, 1) = (BLOCK_SIZE_QO, Dh)
         # we can do this out-of-order since the matmul (the tl.dot in _attn_fwd_inner) and this entry-wise division 
         #  are associative. matmul and entry-wise-ops are not normally, but at this level of granularity it's no longer
         #  actually a matmul but instead individual dot-products
@@ -286,7 +293,7 @@ def attn_fwd(
 
     # This is needed to compute the logsumexp (LSE) for the backwards pass. basically instead of saving the maxes 
     #  and the sums separately, we save them together which still works thanks to exponential arithmetic
-    LSE = M + tl.math.log2(L) # shape (BLOCK_SIZE_QO) fp32
+    LSE = M + tl.math.log2(L) # shape (BLOCK_SIZE_QO)
         # L was composed using the sum & exp operations in _attn_fwd_inner()
         # this will work because softmax(x_i) = exp(x_i - m_i) / l_i 
         #                                     = exp(x_i - m_i) / exp(log(l_i)) 
@@ -298,10 +305,10 @@ def attn_fwd(
     ## storing it all back to DRAM
     LSE_offsets = index_BH * stride_LSE_H + offsets_QO_N
     LSE_mask = block_index_QO * BLOCK_SIZE_QO + tl.arange(0, BLOCK_SIZE_QO) < N
-    tl.store(LSE_ptr + LSE_offsets, LSE, mask=LSE_mask) # shape (BLOCK_SIZE_QO) fp32
+    tl.store(LSE_ptr + LSE_offsets, LSE, mask=LSE_mask) # shape (BLOCK_SIZE_QO)
         # the mask prevents us from saving the useless log_2(n) values at the bottom of LSE
     O_offsets = (offsets_QO_N[:, None] * stride_O_N + offsets_Dh[None, :] * stride_O_Dh)
-    tl.store(O_ptr + O_offsets, O.to(tl.float16), mask=mask_QO_N[:, None]) # shape (BLOCK_SIZE_Q, Dh) fp16
+    tl.store(O_ptr + O_offsets, O, mask=mask_QO_N[:, None]) # shape (BLOCK_SIZE_Q, Dh)
         # the mask prevents us from saving the useless values at the bottom of O corresponding to non-existent tokens
 
 
@@ -309,9 +316,9 @@ def attn_fwd(
     [
         triton.Config({"PRE_BLOCK_SIZE_ROW": PRE_BLOCK_SIZE_ROW},
                         num_stages=num_stages, num_warps=num_warps,)
-        for PRE_BLOCK_SIZE_ROW in [32, 64, 128, 256]
-        for num_stages in [3, 5, 7]
-        for num_warps in [4, 8, 16]
+        for PRE_BLOCK_SIZE_ROW in [32]#, 64, 128, 256]
+        for num_stages in [3]#, 5, 7]
+        for num_warps in [4]#, 8, 16]
     ],
     key=["Dh"],
 )
@@ -389,37 +396,36 @@ def _attn_backward_KV(
         # and the dot product of K and QT simultaneously. in general you should load a bunch
         # of stuff then calc a bunch of stuff rather than flipping b/w loads and calcs
         mask_N = offsets_ROW < N
-        Q_T = tl.load(Q_ptr + Q_T_offsets, mask=mask_N[None, :], other=0.) # shape (Dh, BLOCK_SIZE_ROW) fp16
-        LSE = tl.load(LSE_ptr + offsets_ROW, mask=mask_N, other=0.) # shape (BLOCK_SIZE_ROW) fp32
-        dLdO = tl.load(dLdO_ptr + dLdO_offsets, mask=mask_N[:, None], other=0.) # shape (BLOCK_SIZE_ROW, Dh) fp16
-        Delta = tl.load(Delta_ptr + offsets_ROW, mask=mask_N, other=0.) # shape (BLOCK_SIZE_ROW) fp32
+        Q_T = tl.load(Q_ptr + Q_T_offsets, mask=mask_N[None, :], other=0.) # shape (Dh, BLOCK_SIZE_ROW)
+        LSE = tl.load(LSE_ptr + offsets_ROW, mask=mask_N, other=0.) # shape (BLOCK_SIZE_ROW)
+        dLdO = tl.load(dLdO_ptr + dLdO_offsets, mask=mask_N[:, None], other=0.) # shape (BLOCK_SIZE_ROW, Dh)
+        Delta = tl.load(Delta_ptr + offsets_ROW, mask=mask_N, other=0.) # shape (BLOCK_SIZE_ROW)
         # ^notice the order we load these in is based on the order we use them below
 
         # we'll re-calculate transpose of S and P matrices since doing that here is faster & more importantly
         #  cheaper on memory consumption than if we were to have saved them in our forward pass & read them here
-        S_T = tl.dot(K, Q_T) # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW) fp16
+        S_T = tl.dot(K, Q_T) # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW)
             # no scale here because the operation is associative so we did it earlier on K
             # thanks to masking of K & Q_T, the non-existent out-of-bounds tokens look like a bunch
             #  of zeros hugged up against the bottom and right edges of S_T
         # subtract S_T by the logsumexp then exponentiate to get P_T
-        P_T = tl.exp2(S_T - LSE[None, :]).to(tl.float16) # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW) fp16
+        P_T = tl.exp2(S_T - LSE[None, :]) # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW)
             # this derivative actually requires an extra *ln(2) which we do below at dLdS_T
             # the non-existent tokens that were a bunch of 0's are now a bunch of 1's
-            # fp16 - fp32 should evaluate to fp16 but then tl.exp2 makes it fp32
 
         if MASK: # if we're on the block-diagonal
             # implement a lower-triangular mask. it looks like upper-triangular because we've 
             #  transposed, which is also the reason why our columns & rows are reversed
             mask = (offsets_COL[:, None] <= offsets_ROW[None, :]) # (BLOCK_SIZE_COL, BLOCK_SIZE_ROW)
-            P_T = tl.where(mask, P_T, 0.).to(tl.float16) # tl.where() converts to fp32
+            P_T = tl.where(mask, P_T, 0.)
 
         # compute dLdV
-        dLdV = tl.dot(P_T, dLdO, acc=dLdV) # shape (BLOCK_SIZE_COL, Dh) fp16
+        dLdV = tl.dot(P_T, dLdO, acc=dLdV) # shape (BLOCK_SIZE_COL, Dh)
 
         # compute dLdP_T and dLdS_T to get dLdK
-        dLdP_T = tl.dot(V, tl.trans(dLdO)) # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW) fp16
-        dLdS_T = (P_T * (dLdP_T - Delta[None, :]) * ln2).to(tl.float16) # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW) fp16
-        dLdK = tl.dot(dLdS_T, tl.trans(Q_T), acc=dLdK) # shape (BLOCK_SIZE_COL, D) fp16
+        dLdP_T = tl.dot(V, tl.trans(dLdO)) # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW)
+        dLdS_T = (P_T * (dLdP_T - Delta[None, :]) * ln2) # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW)
+        dLdK = tl.dot(dLdS_T, tl.trans(Q_T), acc=dLdK) # shape (BLOCK_SIZE_COL, D)
             # acc tells the tl.dot to accumulate into dLdK
 
         # increment pointers
@@ -464,32 +470,31 @@ def _attn_backward_Q(
     # we transpose V while loading it
     K_and_V_T_offsets = offsets_Dh[:, None] * stride_Dh + offsets_COL[None, :] * stride_N
 
-    Delta = tl.load(Delta_ptr + offsets_ROW, mask=offsets_ROW<N, other=0.) # shape (BLOCK_SIE_ROW) fp32
+    Delta = tl.load(Delta_ptr + offsets_ROW, mask=offsets_ROW<N, other=0.) # shape (BLOCK_SIE_ROW)
 
     for block_idx in range(num_steps):
         K_T = tl.load(K_ptr + K_and_V_T_offsets, mask=(offsets_COL < N)[None, :], other=0.) 
-            # shape (Dh, BLOCK_SIZE_COL) fp16
+            # shape (Dh, BLOCK_SIZE_COL)
         V_T = tl.load(V_ptr + K_and_V_T_offsets, mask=(offsets_COL < N)[None, :], other=0.) 
-            # shape (Dh, BLOCK_SIZE_COL) fp16
+            # shape (Dh, BLOCK_SIZE_COL)
 
-        S = tl.dot(Q, K_T) # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL) fp16
+        S = tl.dot(Q, K_T) # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
             # no scale here because the operation is associative so we did it earlier on Q
-        P = tl.exp2(S - LSE).to(tl.float16) # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL) fp16
-            # fp16 - fp32 evaluates to fp16 but then tl.exp2 converts to fp32 for some damn reason
+        P = tl.exp2(S - LSE) # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
 
         if MASK: # if we're on the block-diagonal
             mask = (offsets_ROW[:, None] >= offsets_COL[None, :]) # (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
             # setting lower-triangular values to zero since the gradient is upper-triangular
-            P = tl.where(mask, P, 0.) # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL) fp16
+            P = tl.where(mask, P, 0.) # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
 
         # calc dLdP and dLdS to get dLdQ
-        dLdP = tl.dot(dLdO, V_T) # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL) fp16
-        dLdS = (P * (dLdP - Delta[:, None]) * ln2).to(tl.float16) # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
+        dLdP = tl.dot(dLdO, V_T) # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
+        dLdS = (P * (dLdP - Delta[:, None]) * ln2) # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
             # ^this line is equivalent to:
             #weighted_dLdP = tl.sum(dLdP * P, axis=1)  # row-sum over keys
             #dLdS = P * (dLdP - weighted_dLdP[:, None])
             # but trades-off a memory access for a binary & then a reduction op
-        dLdQ += tl.dot(dLdS, tl.trans(K_T)) # shape (BLOCK_SIZE_ROW, Dh) fp16
+        dLdQ += tl.dot(dLdS, tl.trans(K_T)) # shape (BLOCK_SIZE_ROW, Dh)
             # we'll need to de-sdcale dLdQ in the end because K_T was pre-scaled
             # we do it later instead of now bc now would mean num_steps * flops versus just flops
         
@@ -505,10 +510,10 @@ def _attn_backward_Q(
     [
         triton.Config({"BLOCK_SIZE_MACRO": BLOCK_SIZE_MACRO, "BLOCK_SIZE_MICRO": BLOCK_SIZE_MICRO},
                         num_stages=num_stages, num_warps=num_warps,)
-        for BLOCK_SIZE_MICRO in [16, 32, 64]
-        for BLOCK_SIZE_MACRO in [32, 64, 128]
-        for num_stages in [3, 5, 7]
-        for num_warps in [4, 8, 16]
+        for BLOCK_SIZE_MICRO in [16]#, 32, 64]
+        for BLOCK_SIZE_MACRO in [32]#, 64, 128]
+        for num_stages in [3]#, 5, 7]
+        for num_warps in [4]#, 8, 16]
         if BLOCK_SIZE_MACRO > BLOCK_SIZE_MICRO # could do >= but i wanna get mileage out of the loop code we wrote
     ],
     key=["Dh"],
@@ -573,15 +578,14 @@ def attn_backward(
     offsets_Dh = tl.arange(0, Dh)
     KV_offsets = offsets_COL_1[:, None] * stride_N + offsets_Dh[None, :] * stride_Dh
     KV_mask = (offsets_COL_1[:, None] < N) # to avoid out-of-bounds non-existent tokens
-    K = tl.load(K_ptr + KV_offsets, mask=KV_mask, other=0.) # shape (BLOCK_SIZE_COL_1, Dh) fp16
-    V = tl.load(V_ptr + KV_offsets, mask=KV_mask, other=0.) # shape (BLOCK_SIZE_COL_1, Dh) fp16
+    K = tl.load(K_ptr + KV_offsets, mask=KV_mask, other=0.) # shape (BLOCK_SIZE_COL_1, Dh)
+    V = tl.load(V_ptr + KV_offsets, mask=KV_mask, other=0.) # shape (BLOCK_SIZE_COL_1, Dh)
 
     # pre-scaling K allows us to do the multiplication once here as opposed to
     #  num_steps times inside _attn_backward_KV
     # we also scale by rln2 to account for the derivative of tl.exp2() and do it
     #  here instead of inside _attn_backward_KV for the same reason
-    K = (K * (scale * rln2)).to(tl.float16)
-        # the multiplication also turns K into fp32. don't ask me why
+    K *= scale * rln2
 
     # we'll accumulate the gradients into these
     dLdK = tl.zeros([BLOCK_SIZE_COL_1, Dh], dtype=tl.float32)
@@ -621,10 +625,10 @@ def attn_backward(
     )
 
     # scale since we didn't do it inside _attn_backward_KV to save flops
-    dLdK *= scale * rln2 # changes to fp32
+    dLdK *= scale * rln2
     # write back dLdK and dLdV
-    tl.store(dLdK_ptr + KV_offsets, dLdK.to(tl.float16), mask=KV_mask)
-    tl.store(dLdV_ptr + KV_offsets, dLdV.to(tl.float16), mask=KV_mask)
+    tl.store(dLdK_ptr + KV_offsets, dLdK, mask=KV_mask)
+    tl.store(dLdV_ptr + KV_offsets, dLdV, mask=KV_mask)
 
     ### STAGE 2: Now we do dLdQ
     # in this part, like the forward pass we look at a specific block of Q & iterate through K & V
@@ -644,10 +648,10 @@ def attn_backward(
     offsets_ROW = start_ROW + tl.arange(0, BLOCK_SIZE_ROW_2)
     QO_offsets = offsets_ROW[:, None] * stride_N + offsets_Dh[None, :] * stride_Dh
     mask_ROW = offsets_ROW < N
-    Q = tl.load(Q_ptr + QO_offsets, mask=mask_ROW[:, None], other=0.) # shape (BLOCK_SIZE_ROW_2, Dh) fp16
-    Q = (Q * (scale * rln2)).to(tl.float16) # the multiplication by the float changes Q to fp32
-    dLdO = tl.load(dLdO_ptr + QO_offsets, mask=mask_ROW[:, None], other=0.) # shape (BLOCK_SIZE_ROW_2, Dh) fp16
-    LSE = tl.load(LSE_ptr + offsets_ROW, mask=mask_ROW, other=0.)[:, None] # shape (BLOCK_SIZE_ROW_2, 1) fp32
+    Q = tl.load(Q_ptr + QO_offsets, mask=mask_ROW[:, None], other=0.) # shape (BLOCK_SIZE_ROW_2, Dh) 
+    Q *= scale * rln2
+    dLdO = tl.load(dLdO_ptr + QO_offsets, mask=mask_ROW[:, None], other=0.) # shape (BLOCK_SIZE_ROW_2, Dh) 
+    LSE = tl.load(LSE_ptr + offsets_ROW, mask=mask_ROW, other=0.)[:, None] # shape (BLOCK_SIZE_ROW_2, 1) 
 
     # accumulate the gradients into here
     dLdQ = tl.zeros([BLOCK_SIZE_ROW_2, Dh], dtype=tl.float32)
@@ -678,7 +682,7 @@ def attn_backward(
         scale, ln2, rln2,
         MASK=False
     )
-    dLdQ = (dLdQ * (scale * rln2)).to(tl.float16) # multiplication by scalar converts to fp32
+    dLdQ *= scale * rln2
     tl.store(dLdQ_ptr + QO_offsets, dLdQ, mask=mask_ROW[:, None])
 
 
@@ -692,6 +696,7 @@ class _flashattention(torch.autograd.Function):
             # the kernel actually isn't this limited but too much larger and i think it might overwhelm SRAM
         B, H, N, Dh = q.shape
         assert q.device == k.device and q.device == v.device
+        assert q.dtype == k.dtype == v.dtype == torch.float32
 
         # pre-allocate output tensor
         O = torch.empty_like(q) # output tensor will be pre head concatenation and mixing
@@ -729,14 +734,14 @@ class _flashattention(torch.autograd.Function):
         scale = ctx.scale
         B, H, N, Dh = ctx.B, ctx.H, ctx.N, ctx.Dh
 
-        dLdq = torch.empty_like(q) # shape (B, H, N, Dh) fp16
+        dLdq = torch.empty_like(q) # shape (B, H, N, Dh)
         dLdk = torch.empty_like(k)
         dLdv = torch.empty_like(v)
 
         dLdO = dLdO.contiguous()
         assert q.stride() == k.stride() == v.stride() == O.stride() == dLdO.stride()
 
-        Delta = torch.empty_like(LSE) # shape (B, H, N) fp32
+        Delta = torch.empty_like(LSE) # shape (B, H, N)
         # the ordering of your grid matters because it determines which programs end up sharing the same SRAM
         pre_grid = lambda meta: (triton.cdiv(N, meta["PRE_BLOCK_SIZE_ROW"]), B * H)
             # in this case, we want the parallelizations along the N dimension to be near each other so they can
@@ -765,17 +770,18 @@ triton_attention = _flashattention.apply
     
 
 ######### Step 1 #########
-def test_flashattention_kernel(B, H, N, Dh, device=DEVICE):
+def test_flashattention_kernel(B, H, N, Dh, device=DEVICE, atol=5e-3):
     # create data
-    q = torch.randn((B, H, N, Dh), dtype=torch.float16, device=device, requires_grad=True)
-    k = torch.randn((B, H, N, Dh), dtype=torch.float16, device=device, requires_grad=True)
-    v = torch.randn((B, H, N, Dh), dtype=torch.float16, device=device, requires_grad=True)
+    q = torch.randn((B, H, N, Dh), dtype=torch.float32, device=device, requires_grad=True)
+    k = torch.randn((B, H, N, Dh), dtype=torch.float32, device=device, requires_grad=True)
+    v = torch.randn((B, H, N, Dh), dtype=torch.float32, device=device, requires_grad=True)
     sm_scale = 1/math.sqrt(Dh) # idk why I made scale a parameter to be passed in, whatever too late now
     # forward pass
     tri_out = triton_attention(q, k, v, sm_scale)
     ref_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
 
     """
+    # you could un-comment this if you want to visually analyze patterns in any errors
     import os
     import numpy as np
     import matplotlib.pyplot as plt
@@ -790,12 +796,12 @@ def test_flashattention_kernel(B, H, N, Dh, device=DEVICE):
     plt.xlabel("Model/Head Dimension")
     plt.ylabel("Sequence Position")
     plt.colorbar()
-    plt.savefig('./heatmap.png')
+    plt.savefig('./out_heatmap.png')
     plt.close()
     """
-
+    
     # compare
-    torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0) 
+    torch.testing.assert_close(tri_out, ref_out, atol=atol, rtol=0) 
     print("passed fwd")
 
     # backward pass (triton)
@@ -807,10 +813,57 @@ def test_flashattention_kernel(B, H, N, Dh, device=DEVICE):
     ref_out.backward(dLdout, retain_graph=True)
     dLdq_ref, dLdk_ref, dLdv_ref = [_.grad.clone() for _ in [q, k, v]]
     q.grad, k.grad, v.grad = None, None, None
+
+    """
+    # you could un-comment this if you want to visually analyze patterns in any errors
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    # dLdq Convert to numpy arrays
+    actual = dLdq_ref.detach().cpu().numpy()
+    expected = dLdq_tri.detach().cpu().numpy()
+    # Compute differences and masks
+    abs_diff = np.abs(expected - actual)
+    abs_fail_mask = (abs_diff > atol).astype(np.int32)
+    plt.figure(figsize=(8, 6))
+    plt.imshow(abs_fail_mask[0][0], cmap="hot", aspect="auto")
+    plt.xlabel("Model/Head Dimension")
+    plt.ylabel("Sequence Position")
+    plt.colorbar()
+    plt.savefig('./dLdq_out_heatmap.png')
+    plt.close()
+    # dLdk Convert to numpy arrays
+    actual = dLdk_ref.detach().cpu().numpy()
+    expected = dLdk_tri.detach().cpu().numpy()
+    # Compute differences and masks
+    abs_diff = np.abs(expected - actual)
+    abs_fail_mask = (abs_diff > atol).astype(np.int32)
+    plt.figure(figsize=(8, 6))
+    plt.imshow(abs_fail_mask[0][0], cmap="hot", aspect="auto")
+    plt.xlabel("Model/Head Dimension")
+    plt.ylabel("Sequence Position")
+    plt.colorbar()
+    plt.savefig('./dLdk_out_heatmap.png')
+    plt.close()
+    # dLdv Convert to numpy arrays
+    actual = dLdv_ref.detach().cpu().numpy()
+    expected = dLdv_tri.detach().cpu().numpy()
+    # Compute differences and masks
+    abs_diff = np.abs(expected - actual)
+    abs_fail_mask = (abs_diff > atol).astype(np.int32)
+    plt.figure(figsize=(8, 6))
+    plt.imshow(abs_fail_mask[0][0], cmap="hot", aspect="auto")
+    plt.xlabel("Model/Head Dimension")
+    plt.ylabel("Sequence Position")
+    plt.colorbar()
+    plt.savefig('./dLdv_out_heatmap.png')
+    plt.close()
+    """
+
     # compare
-    torch.testing.assert_close(dLdq_tri, dLdq_ref, atol=1e-2, rtol=0)
-    torch.testing.assert_close(dLdk_tri, dLdk_ref, atol=1e-2, rtol=0)
-    torch.testing.assert_close(dLdv_tri, dLdv_ref, atol=1e-2, rtol=0)
+    torch.testing.assert_close(dLdq_tri, dLdq_ref, atol=atol, rtol=0)
+    torch.testing.assert_close(dLdk_tri, dLdk_ref, atol=atol, rtol=0)
+    torch.testing.assert_close(dLdv_tri, dLdv_ref, atol=atol, rtol=0)
     print("Passed bwd")
     
 
@@ -837,23 +890,23 @@ for mode in ["fwd", "bwd"]:
 @triton.testing.perf_report(configs)
 def bench_flash_attention(SEQ_LEN, mode, provider, device=DEVICE):
     assert mode in ["fwd", "bwd"]
-    dtype = torch.float16
+    dtype = torch.float32
     BATCH, N_HEADS = 32, 4 # LOWER THESE IF YOU DON'T HAVE ENOUGH RAM
     HEAD_DIM = 128 # AND THIS IF YOU DON"T HAVE ENOUGH SRAM
-    q = torch.randn((BATCH, H, SEQ_LEN, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-    k = torch.randn((BATCH, H, SEQ_LEN, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-    v = torch.randn((BATCH, H, SEQ_LEN, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    q = torch.randn((BATCH, N_HEADS, SEQ_LEN, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    k = torch.randn((BATCH, N_HEADS, SEQ_LEN, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    v = torch.randn((BATCH, N_HEADS, SEQ_LEN, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     sm_scale = 1 / math.sqrt(HEAD_DIM)
     if provider == 'torch':
         fn = lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
     if provider == 'this_tutorial':
-        fn = lambda: this_tutorial.apply(q, k, v, sm_scale)
+        fn = lambda: triton_attention(q, k, v, sm_scale)
     if mode == "bwd":
         O = fn()
         dLdO = torch.randn_like(O)
         fn = lambda: O.backward(dLdO, retain_graph=True)
     ms = triton.testing.do_bench(fn)
-    flops_per_matmul = 2.0 * BATCH * H * SEQ_LEN * SEQ_LEN * HEAD_DIM
+    flops_per_matmul = 2.0 * BATCH * N_HEADS * SEQ_LEN * SEQ_LEN * HEAD_DIM
     total_flops = 2 * flops_per_matmul * 0.5
     if mode == "bwd":
         total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
