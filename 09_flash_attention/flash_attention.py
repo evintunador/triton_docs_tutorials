@@ -63,14 +63,14 @@ def _attn_fwd_inner(
     N of Q      ------>
                 --------->
                 ------------>
-    and to get even more accurate, we do the diagonal in our first call of this inner kernel
+    and to get even more accurate, we do the diagonal in our second call of this inner kernel
                 N of K & V
                 x
                    x
     N of Q            x
                          x
                             x
-    and then the next call gets all the parts below the diagonal
+    and then the first call gets all the parts below the diagonal
                 N of K & V
                 
                 -->
@@ -189,7 +189,7 @@ def attn_fwd(
     B, # unlike other tensor dimensions, batch size can be more flexible for runtime differences
     # meta-parameters (decided at compile-time)
     H: tl.constexpr, N: tl.constexpr, 
-    Dh: tl.constexpr, # should always be a power of 2, and really 128 and 256 are the only reasonable options
+    Dh: tl.constexpr, # should always be a power of 2
     BLOCK_SIZE_QO: tl.constexpr, BLOCK_SIZE_KV: tl.constexpr,
 ):
     # in order to use tl.exp2 later isntead of tl.exp (the former is faster) we need to scale our softmax scale by ln2
@@ -234,7 +234,7 @@ def attn_fwd(
     Q_offsets = (offsets_QO_N[:, None] * stride_Q_N + offsets_Dh[None, :] * stride_Q_Dh)
         # shape (BLOCK_SIZE_QO, Dh)
     # we transpose K while loading it (as opposed to writing a whole separate kernel for transpose)
-    K_T_offsets = (offsets_Dh[:, None] * stride_V_Dh + offsets_KV_N[None, :] * stride_V_N)
+    K_T_offsets = (offsets_Dh[:, None] * stride_K_Dh + offsets_KV_N[None, :] * stride_K_N)
         # shape (Dh, BLOCK_SIZE_KV)
     V_offsets = (offsets_KV_N[:, None] * stride_V_N + offsets_Dh[None, :] * stride_V_Dh)
         # shape (BLOCK_SIZE_KV, Dh)
@@ -709,6 +709,17 @@ class _flashattention(torch.autograd.Function):
         )
         # notice the sequence dimension axis is first, and BH parallelization axis is second
         # this is because we want the former to have PIDs on the same SM
+
+        """
+        imagine for a launch grid of (3, 2) wiwth 3 SMs that can each hold 2 PIDs
+        we'd have PIDs:
+        [0, 0] \ SM0
+        [1, 0] /
+        [2, 0] \ SM1
+        [0, 1] /
+        [1, 1] \ SM2
+        [2, 1] /
+        """
 
         attn_fwd[grid](
             q, k, v, O, LSE, 
