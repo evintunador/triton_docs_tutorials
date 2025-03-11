@@ -1,4 +1,4 @@
-# triton_docs_tutorials
+# Triton Tutorials
 making the [official triton documentation tutorials](https://triton-lang.org/main/getting-started/tutorials/index.html) actually comprehensible by *heavily* commenting in-detail about every little thing that's happening. Follow them in order of filename and check out the accompanying videos:
 
 [![ERROR DISPLAYING IMAGE, CLICK HERE FOR VIDEO](https://img.youtube.com/vi/TUQAyCNxFe4/0.jpg)](https://youtube.com/playlist?list=PLPefVKO3tDxOJLAmCA75uShbe1z_RNqkQ&si=C5VF9fNW8CYZzh9x)
