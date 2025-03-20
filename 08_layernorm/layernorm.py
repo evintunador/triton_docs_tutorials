@@ -295,7 +295,7 @@ class LayerNorm(torch.autograd.Function):
                 # fp32 element_size = 4, fp16 element_size = 2, fp8 element_size = 1
             # so this is used to calculate how many elements can fit within a 64KB block of memory
             # 64KB is a heuristic for the smallest possible SRAM size our GPU is likely to have; it'd be beter
-            #  if we got our GPU's actual SRAM size and used that (look back at lesson 2 for how to do this)
+            #  if we got our GPU's actual SRAM size and used that (look back at lesson 5 for how to do this)
         BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
             # we'll either define block_size by 
             # - the maximum amount of entries that a 64kb block of memory can hold or
