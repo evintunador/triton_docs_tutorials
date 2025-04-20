@@ -150,8 +150,8 @@ def _matmul_kernel(
     [_, _, _, _]        [x, _, _, _]
     PID = 5
     [_, _, _, _]        [_, x, _, _]
-    [x, x, x, x]        [_, x, _, _]
     [_, _, _, _]        [_, x, _, _]
+    [x, x, x, x]        [_, x, _, _]
     [_, _, _, _]        [_, x, _, _]
     Now suddenly with this hypoethetical new setup, we would only need to load 
         (2 rows of blocks of A) + (2 columns of blocks of B) = 4 total rows/cols of blocks loaded to SRAM
