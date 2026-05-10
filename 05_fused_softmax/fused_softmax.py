@@ -194,8 +194,8 @@ def softmax(x):
     # x.stride() for each dimension tells us how many entries in memory a pointer needs to move forward in order
     #  to get to the next element of the tensor along the specified dimension. 
     # For any tensor x that is "contiguous", meaning ~cleanly/simply~ defined in memory and for a shape (M, N, K) 
-    #  you can expect x.shape(0) == N*K, x.shape(1)==K, and x.shape(2)==1, or more generally 
-    #  x.shape(-Z)==math.prod(x.shape[-Z:])
+    #  you can expect x.stride(0) == N*K, x.stride(1)==K, and x.stride(2)==1, or more generally 
+    #  x.stride(-Z)==math.prod(x.shape[-Z:])
     # A tensor might be non-contiguous if, for example, it's been saved to memory using torch.view() or some similar
     #  operation that leaves the original data in place but messes with dimensions
 
