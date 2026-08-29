@@ -102,7 +102,7 @@ def _attn_fwd_inner(
         mask_KV_N = offsets_KV_N < N
         K_T = tl.load(K_ptr + K_T_offsets, mask=mask_KV_N[None, :], other=0.) # shape (Dh, BLOCK_SIZE_KV)
             # sequence mask sets non-existent tokens in the block past N to zero vectors
-        S = tl.dot(Q, K_T) * softmax_scale # shape (BLOCK_SIZE_QO, BLOCK_SIZE_KV)
+        S = tl.dot(Q, K_T, input_precision="ieee") * softmax_scale # shape (BLOCK_SIZE_QO, BLOCK_SIZE_KV)
             # the masked tokens create columns & rows of zeros hugging the bottom and right edges of S
 
         if DIAGONAL: # if we're currently on a block containing the diagonal
@@ -143,7 +143,7 @@ def _attn_fwd_inner(
         # adjusts previous values based on potential new max
         O = O * alpha[:, None] # shape (BLOCK_SIZE_QO, Dh)
         # accumulated P and V block dot product into O
-        O = tl.dot(P, V, acc=O) # shape (BLOCK_SIZE_QO, Dh)
+        O = tl.dot(P, V, acc=O, input_precision="ieee") # shape (BLOCK_SIZE_QO, Dh)
             # notice we're doing this V projection before we've actually divided by our softmax denominator l_i
             #  which is possible because in this context the two operations are associative
             # acc tells triton to accumulate the values into O_block
@@ -404,7 +404,7 @@ def _attn_backward_KV(
 
         # we'll re-calculate transpose of S and P matrices since doing that here is faster & more importantly
         #  cheaper on memory consumption than if we were to have saved them in our forward pass & read them here
-        S_T = tl.dot(K, Q_T) # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW)
+        S_T = tl.dot(K, Q_T, input_precision="ieee") # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW)
             # no scale here because the operation is associative so we did it earlier on K
             # thanks to masking of K & Q_T, the non-existent out-of-bounds tokens look like a bunch
             #  of zeros hugged up against the bottom and right edges of S_T
@@ -420,12 +420,12 @@ def _attn_backward_KV(
             P_T = tl.where(mask, P_T, 0.)
 
         # compute dLdV
-        dLdV = tl.dot(P_T, dLdO, acc=dLdV) # shape (BLOCK_SIZE_COL, Dh)
+        dLdV = tl.dot(P_T, dLdO, acc=dLdV, input_precision="ieee") # shape (BLOCK_SIZE_COL, Dh)
 
         # compute dLdP_T and dLdS_T to get dLdK
-        dLdP_T = tl.dot(V, tl.trans(dLdO)) # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW)
+        dLdP_T = tl.dot(V, tl.trans(dLdO), input_precision="ieee") # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW)
         dLdS_T = (P_T * (dLdP_T - Delta[None, :]) * ln2) # shape (BLOCK_SIZE_COL, BLOCK_SIZE_ROW)
-        dLdK = tl.dot(dLdS_T, tl.trans(Q_T), acc=dLdK) # shape (BLOCK_SIZE_COL, D)
+        dLdK = tl.dot(dLdS_T, tl.trans(Q_T), acc=dLdK, input_precision="ieee") # shape (BLOCK_SIZE_COL, D)
             # acc tells the tl.dot to accumulate into dLdK
 
         # increment pointers
@@ -478,7 +478,7 @@ def _attn_backward_Q(
         V_T = tl.load(V_ptr + K_and_V_T_offsets, mask=(offsets_COL < N)[None, :], other=0.) 
             # shape (Dh, BLOCK_SIZE_COL)
 
-        S = tl.dot(Q, K_T) # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
+        S = tl.dot(Q, K_T, input_precision="ieee") # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
             # no scale here because the operation is associative so we did it earlier on Q
         P = tl.exp2(S - LSE) # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
 
@@ -488,13 +488,13 @@ def _attn_backward_Q(
             P = tl.where(mask, P, 0.) # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
 
         # calc dLdP and dLdS to get dLdQ
-        dLdP = tl.dot(dLdO, V_T) # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
+        dLdP = tl.dot(dLdO, V_T, input_precision="ieee") # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
         dLdS = (P * (dLdP - Delta[:, None]) * ln2) # shape (BLOCK_SIZE_ROW, BLOCK_SIZE_COL)
             # ^this line is equivalent to:
             #weighted_dLdP = tl.sum(dLdP * P, axis=1)  # row-sum over keys
             #dLdS = P * (dLdP - weighted_dLdP[:, None])
             # but trades-off a memory access for a binary & then a reduction op
-        dLdQ += tl.dot(dLdS, tl.trans(K_T)) # shape (BLOCK_SIZE_ROW, Dh)
+        dLdQ += tl.dot(dLdS, tl.trans(K_T), input_precision="ieee") # shape (BLOCK_SIZE_ROW, Dh)
             # we'll need to de-sdcale dLdQ in the end because K_T was pre-scaled
             # we do it later instead of now bc now would mean num_steps * flops versus just flops
         
